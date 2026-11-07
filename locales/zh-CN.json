@@ -30,6 +30,7 @@
   "Couldn't load": "没加载成功",
   "Quality": "音质",
   "Last search problem": "上次搜索的问题",
+  "Last sign-in problem": "上次登录的问题",
   "Last playback": "上次播放",
   "Go to the settings and paste an LX source script URL, such as a raw GitHub link.": "去设置里填入一个 LX 音源脚本的地址，比如某个 raw GitHub 链接。",
   "Note": "说明",

@@ -29,9 +29,13 @@ const PLAYLIST_TRACK_MAX = 100;
 const HOT_CHART_ID = "26";
 const QR_POLL_INTERVAL = 1500; // 扫码状态多久问一次
 const QR_DEADLINE = 3 * 60 * 1000; // 一张二维码最多等多久
-const QR_UNIKEY_URL = "https://music.163.com/api/login/qrcode/unikey";
-const QR_POLL_URL = "https://music.163.com/api/login/qrcode/client/login";
+const QR_UNIKEY_PATH = "/api/login/qrcode/unikey";
+const QR_POLL_PATH = "/api/login/qrcode/client/login";
 const QR_LOGIN_URL = "https://music.163.com/login";
+const EAPI_SITE = "https://interfacepc.music.163.com";
+const EAPI_KEY = "e82ckenh8dichen8";
+const EAPI_UA = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
+const SESSION_COOKIES = ["MUSIC_U", "__csrf", "NMTID"];
 
 // 展示层只用中性代号：wy / tx 是音源脚本里的 source key，不对外展开成名称。
 const CATALOG_LABEL = { wy: "Catalog A", tx: "Catalog B" };
@@ -678,12 +682,6 @@ function signedSources() {
   return Object.keys(CATALOG_SITES).filter((source) => credential(source));
 }
 
-function formEncode(data) {
-  return Object.keys(data)
-    .map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(data[key])}`)
-    .join("&");
-}
-
 function cookieHeader(jar) {
   return Object.keys(jar)
     .map((name) => `${name}=${jar[name]}`)
@@ -693,42 +691,74 @@ function cookieHeader(jar) {
 // 登录态是响应头里逐个下发的 cookie，攒起来供后续请求和本人列表读取使用。
 function collectCookies(response, jar) {
   const headers = response && response.headers;
-  let lines = [];
-  if (headers && typeof headers.getSetCookie === "function") {
-    lines = headers.getSetCookie();
-  } else {
-    const raw = headers && typeof headers.get === "function" ? headers.get("set-cookie") || "" : "";
-    lines = String(raw).split(/,(?=\s*[^;,=\s]+=)/);
-  }
+  const lines = headers && typeof headers.getSetCookie === "function"
+    ? headers.getSetCookie()
+    : String((headers && typeof headers.get === "function" && headers.get("set-cookie")) || "")
+      .split(/,(?=\s*[^;,=\s]+=)/);
   for (const line of lines) {
     const pair = String(line).split(";")[0].trim();
     const eq = pair.indexOf("=");
     if (eq < 1) continue;
     const name = pair.slice(0, eq).trim();
     const value = pair.slice(eq + 1).trim();
-    if (!name) continue;
-    if (!value || value === '""' || /deleted|expired/i.test(String(line))) delete jar[name];
+    if (!SESSION_COOKIES.includes(name)) continue;
+    const maxAge = /;\s*max-age\s*=\s*(-?\d+)/i.exec(line);
+    const expires = /;\s*expires\s*=\s*([^;]+)/i.exec(line);
+    const stale = maxAge ? Number(maxAge[1]) <= 0 : expires && Date.parse(expires[1]) <= Date.now();
+    if (!value || stale) delete jar[name];
     else jar[name] = value;
   }
 }
 
-async function authPost(source, url, data, jar) {
-  const form = { ...data };
-  if (jar.__csrf) form.csrf_token = jar.__csrf;
-  const headers = {
-    "User-Agent": UA,
-    Referer: CATALOG_SITES[source].referer,
-    "Content-Type": "application/x-www-form-urlencoded",
-  };
-  const cookie = cookieHeader(jar);
-  if (cookie) headers.Cookie = cookie;
+function sessionDeviceId() {
+  let id = host.storage.get("deviceId");
+  if (!id) {
+    id = Array.from({ length: 52 }, () => Math.floor(Math.random() * 16).toString(16)).join("").toUpperCase();
+    host.storage.set("deviceId", id);
+  }
+  return String(id);
+}
 
+function eapiPayload(path, params, jar) {
+  const header = {
+    osver: "Microsoft-Windows-10-Professional-build-19045-64bit",
+    deviceId: sessionDeviceId(),
+    os: "pc",
+    appver: "3.1.17.204416",
+    versioncode: "140",
+    mobilename: "",
+    buildver: String(Math.floor(Date.now() / 1000)),
+    resolution: "1920x1080",
+    channel: "netease",
+    requestId: `${Date.now()}_${String(Math.floor(Math.random() * 1000)).padStart(4, "0")}`,
+    __csrf: "",
+    ...jar,
+  };
+  const text = JSON.stringify({ ...params, header, e_r: false });
+  const digest = host.crypto.md5(`nobody${path}use${text}md5forencrypt`);
+  const encrypted = host.crypto.aesEcbEncrypt(
+    EAPI_KEY,
+    `${path}-36cd479b6b5-${text}-36cd479b6b5-${digest}`,
+  );
+  return { header, body: `params=${encrypted.toUpperCase()}` };
+}
+
+async function eapiPost(path, params, jar) {
+  const { header, body } = eapiPayload(path, params, jar);
+  const headers = {
+    "User-Agent": EAPI_UA,
+    Referer: CATALOG_SITES.wy.referer,
+    "Content-Type": "application/x-www-form-urlencoded",
+    Cookie: Object.keys(header)
+      .map((name) => `${encodeURIComponent(name)}=${encodeURIComponent(header[name])}`)
+      .join("; "),
+  };
   const controller = newController();
-  const init = { method: "POST", headers, body: formEncode(form) };
+  const init = { method: "POST", headers, body, redirect: "error" };
   if (controller) init.signal = controller.signal;
   const timer = controller ? setTimeout(() => controller.abort(), CATALOG_TIMEOUT) : null;
   try {
-    const response = await fetch(url, init);
+    const response = await fetch(EAPI_SITE + path.replace(/^\/api\//, "/eapi/"), init);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     collectCookies(response, jar);
     const text = await response.text();
@@ -751,10 +781,10 @@ function wait(ms) {
 }
 
 // 二维码由宿主显示；状态轮询到手机确认后才把凭证落到本机。
-async function qrSignIn(source, epoch) {
+async function qrSignIn(epoch) {
   const jar = {};
   showSignInPrompt(t("Preparing a sign-in QR code..."));
-  const key = await authPost(source, QR_UNIKEY_URL, { type: 3 }, jar);
+  const key = await eapiPost(QR_UNIKEY_PATH, { type: 3 }, jar);
   const unikey = key && key.unikey;
   if (!unikey) throw fail("setup", t("The QR code could not be created; try again."));
 
@@ -766,7 +796,7 @@ async function qrSignIn(source, epoch) {
     await wait(QR_POLL_INTERVAL);
     if (epoch !== loginEpoch) throw fail("unavailable", t("Sign-in was cancelled."));
 
-    const status = await authPost(source, QR_POLL_URL, { key: unikey, type: 3 }, jar);
+    const status = await eapiPost(QR_POLL_PATH, { key: unikey, type: 3 }, jar);
     const code = status && status.code;
     if (code === 800) throw fail("setup", t("The QR code expired; sign in again."));
     if (code === 802) showSignInPrompt(t("Scanned. Confirm the sign-in on your phone."), qr);
@@ -1503,6 +1533,8 @@ export async function home() {
 
   const lastSearchError = host.storage.get("lastSearchError");
   if (lastSearchError) sections.push({ title: t("Last search problem"), empty: lastSearchError });
+  const lastSignInError = host.storage.get("lastSignInError");
+  if (lastSignInError) sections.push({ title: t("Last sign-in problem"), empty: lastSignInError });
 
   // 发现能力只放几个普通链接，不占侧边栏，也不在首页拉数据。
   if (catalogOn()) {
@@ -1691,28 +1723,34 @@ export async function signIn() {
   const epoch = ++loginEpoch;
   const source = catalogProviders()[0];
   const site = CATALOG_SITES[source];
-  let cookie = "";
-  if (source === "wy" && typeof host.signInPrompt === "function") {
-    cookie = await qrSignIn(source, epoch);
-  } else if (typeof host.webSignIn === "function") {
-    const answer = await host.webSignIn({
-      url: site.signIn,
-      cookiesOf: site.signIn,
-      until: site.until,
-      userAgent: UA,
-    });
-    cookie = answer && answer.cookie ? String(answer.cookie) : "";
+  try {
+    let cookie = "";
+    if (source === "wy" && typeof host.signInPrompt === "function") {
+      cookie = await qrSignIn(epoch);
+    } else if (typeof host.webSignIn === "function") {
+      const answer = await host.webSignIn({
+        url: site.signIn,
+        cookiesOf: site.signIn,
+        until: site.until,
+        userAgent: UA,
+      });
+      cookie = answer && answer.cookie ? String(answer.cookie) : "";
+    }
+    if (epoch !== loginEpoch) throw fail("unavailable", t("Sign-in was cancelled."));
+    if (!cookie) cookie = String(host.setting("credential") || "").trim();
+    if (!cookie) {
+      throw fail("setup", t("Sign in isn't available here; put your sync credential in the plugin settings."));
+    }
+    host.storage.set(`credential:${source}`, cookie);
+    catalogCache.clear();
+    const profile = await profileOf(source);
+    host.storage.set("account", profile);
+    host.storage.remove("lastSignInError");
+    return account();
+  } catch (error) {
+    host.storage.set("lastSignInError", `${new Date().toISOString()} ${(error && error.message) || error}`);
+    throw error;
   }
-  if (epoch !== loginEpoch) throw fail("unavailable", t("Sign-in was cancelled."));
-  if (!cookie) cookie = String(host.setting("credential") || "").trim();
-  if (!cookie) {
-    throw fail("setup", t("Sign in isn't available here; put your sync credential in the plugin settings."));
-  }
-  host.storage.set(`credential:${source}`, cookie);
-  catalogCache.clear();
-  const profile = await profileOf(source);
-  host.storage.set("account", profile);
-  return account();
 }
 
 export function signOut() {

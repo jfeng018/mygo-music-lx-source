@@ -17,6 +17,7 @@ let qrCodes = [803];
 let qrSessionCookie = true;
 const qrPrompts = [];
 const qrRequestHeaders = [];
+const qrEapiCalls = [];
 
 globalThis.host = {
   platform: "darwin",
@@ -140,10 +141,13 @@ globalThis.fetch = async (url, init) => {
   if (target.includes("/api/v3/discovery/recommend/songs")) {
     return jsonResponse({ data: { dailySongs: [WY_SONG] } });
   }
-  if (target.includes("/api/login/qrcode/unikey")) {
+  if (target.includes("/eapi/login/qrcode/")) {
+    qrEapiCalls.push({ target, body: (init && init.body) || "", redirect: init && init.redirect });
+  }
+  if (target.includes("/eapi/login/qrcode/unikey")) {
     return jsonResponse({ code: 200, unikey: "test-unikey" }, ["NMTID=n1; Path=/"]);
   }
-  if (target.includes("/api/login/qrcode/client/login")) {
+  if (target.includes("/eapi/login/qrcode/client/login")) {
     const code = qrCodes[Math.min(qrPolls, qrCodes.length - 1)];
     qrPolls++;
     qrRequestHeaders.push((init && init.headers) || {});
@@ -650,6 +654,7 @@ test("扫码登录：显示二维码、轮询到确认并保存凭证", async ()
   qrSessionCookie = true;
   qrPrompts.length = 0;
   qrRequestHeaders.length = 0;
+  qrEapiCalls.length = 0;
   try {
     const signed = await withFastQrPoll(() => lx.signIn());
     assert.equal(signed.id, "42");
@@ -665,6 +670,11 @@ test("扫码登录：显示二维码、轮询到确认并保存凭证", async ()
     assert.match(store.get("credential:wy"), /MUSIC_U=u1/);
     assert.match(store.get("credential:wy"), /__csrf=c1/);
     assert.match(qrRequestHeaders[0].Cookie, /NMTID=n1/);
+    assert.equal(qrEapiCalls.length, 4);
+    assert.match(qrEapiCalls[0].target, /\/eapi\/login\/qrcode\/unikey$/);
+    assert.match(qrEapiCalls[0].body, /^params=[0-9A-F]+$/);
+    assert.equal(qrEapiCalls[0].redirect, "error");
+    assert.equal(store.has("lastSignInError"), false);
     assert.equal(lx.account().id, "42");
   } finally {
     delete globalThis.host.signInPrompt;
@@ -673,6 +683,7 @@ test("扫码登录：显示二维码、轮询到确认并保存凭证", async ()
     qrSessionCookie = true;
     qrPrompts.length = 0;
     qrRequestHeaders.length = 0;
+    qrEapiCalls.length = 0;
     lx.signOut();
   }
 });
@@ -686,6 +697,7 @@ test("扫码登录：过期、缺会话、取消都明确报错", async () => {
       () => withFastQrPoll(() => lx.signIn()),
       (error) => error.code === "setup" && /expired/.test(error.message),
     );
+    assert.match(store.get("lastSignInError"), /expired/);
 
     qrCodes = [803];
     qrPolls = 0;
@@ -706,6 +718,7 @@ test("扫码登录：过期、缺会话、取消都明确报错", async () => {
     qrCodes = [803];
     qrPolls = 0;
     qrSessionCookie = true;
+    store.delete("lastSignInError");
     lx.signOut();
   }
 });
