@@ -1,0 +1,32 @@
+{
+  "id": "lx-source",
+  "name": "LX Source",
+  "version": "0.1.0",
+  "minAppVersion": "0.1.20",
+  "main": "index.js",
+  "playback": "stream",
+  "permissions": {
+    "network": ["*"]
+  },
+  "settings": [
+    {
+      "key": "scriptUrls",
+      "label": "Source script URLs",
+      "help": "One or more LX Music custom source .js links, separated by commas or new lines. Every source is asked at once when a song plays, and the fastest answer plays."
+    },
+    {
+      "key": "script",
+      "label": "Source script (pasted)",
+      "help": "Optional. Paste a script here and it joins the ones above."
+    },
+    {
+      "key": "platform",
+      "label": "Search platform",
+      "help": "wy for NetEase Cloud Music, tx for QQ Music, or leave it empty to search both."
+    }
+  ],
+  "navigation": [
+    { "title": "LX Source", "builtin": "home" },
+    { "title": "Sources", "page": "sources", "icon": "playlist" }
+  ]
+}
