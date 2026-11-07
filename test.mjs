@@ -614,6 +614,16 @@ test("交付文件里不出现任何曲库名称", async () => {
   }
 });
 
+test("文档保留出处，但不写参考或照搬语义", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const readme = await readFile(new URL("./README.md", import.meta.url), "utf8");
+  const source = await readFile(new URL("./index.js", import.meta.url), "utf8");
+  assert.match(readme, /洛雪音乐（LX Music）/);
+  assert.match(readme, /MyGo Music/);
+  assert.match(readme, /github\.com/);
+  assert.doesNotMatch(readme + source, /参考|借鉴|抄|复刻|照搬|based on|adapted from/i);
+});
+
 test("所有界面文案都有中文翻译", async () => {
   const { readFile } = await import("node:fs/promises");
   const src = await readFile(new URL("./index.js", import.meta.url), "utf8");

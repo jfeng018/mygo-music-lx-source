@@ -677,7 +677,7 @@ function cookieValue(cookie, name) {
   return match ? decodeURIComponent(match[1]) : "";
 }
 
-// 网页端把登录态折算成请求参数的公开算法，只用于读取本人主页。
+// 请求参数由本机凭证折算得出，只用于读取本人列表。
 function hash33(text) {
   let value = 5381;
   for (let i = 0; i < text.length; i++) value += (value << 5) + text.charCodeAt(i);

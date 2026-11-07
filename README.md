@@ -83,7 +83,7 @@ mygo-music://install-plugin?repo=jfeng018/mygo-music-lx-source
 | `lx.utils.crypto.randomBytes` | 随机十六进制串，有 `crypto.getRandomValues` 就走安全随机源 |
 | `lx.utils.crypto.aesEncrypt` | 只支持 AES-ECB（走 `host.crypto.aesEcbEncrypt`） |
 
-脚本用 `new Function` 执行，`module.exports`、`require('crypto')`、`require('buffer')` 都有最小实现。`require('crypto').createHash` 只实现 md5，别的算法会明确报错而不是给一个错误结果。`on(EVENT_NAMES.request, ...)` 可以注册多个，依次尝试。两种写法都认：`module.exports = { sources }`，或者标准的 `on(...)` + `send(EVENT_NAMES.inited, ...)`。
+脚本用 `new Function` 执行，`module.exports`、`require('crypto')`、`require('buffer')` 都有最小实现。`require('crypto').createHash` 只实现 md5，别的算法会明确报错而不是给一个错误结果。`on(EVENT_NAMES.request, ...)` 可以注册多个，依次尝试。两种写法都认：`module.exports = { sources }`，或者 `on(...)` + `send(EVENT_NAMES.inited, ...)`。
 
 **不支持**：RSA、AES-CBC、zlib，以及 md5 之外的摘要算法。需要这些的音源脚本会明确报错，换一个只用普通 HTTP 接口的即可。
 
