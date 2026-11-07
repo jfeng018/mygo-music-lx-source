@@ -32,13 +32,13 @@ MyGo Music **0.1.20** 或更新——封面用了 `{size}` 模板，更早的版
 mygo-music://install-plugin?repo=jfeng018/mygo-music-lx-source
 ```
 
-装好后在 **设置 → 插件 → LX 音源** 里填 **音源脚本地址**：一个或多个 LX 自定义音源 `.js` 的直链，用逗号或换行分隔。也可以直接把脚本内容粘进第二项，它会和地址里的脚本一起用。
+装好后在 **设置 → 插件 → LX 音源** 里填 **音源脚本地址**：一个或多个 LX 自定义音源 `.js` 的直链，用换行分隔；逗号、分号或空格后面紧跟另一个链接时也能分开。也可以直接把脚本内容粘进第二项，它会和地址里的脚本一起用。
 
 填完打开插件首页，能看到脚本名和支持的平台就说明加载成功了。
 
 ## 用起来是什么样
 
-- **多音源并发**：配了几个音源，播放时就同时问几个，谁先给出能播的地址就用谁，剩下的直接丢掉。慢的源最多等 10 秒，不会拖住播放。
+- **多音源并发**：配了几个音源，播放时就同时问几个，谁先给出能用的地址就用谁，其余的请求立刻收掉。慢的源最多等 10 秒；有多个源时会先探测一次地址，404 / 410 或连不上的死链会被跳过，继续等其它源。
 - 搜索：同时搜两个平台，**当前音源能播的结果排在前面**，点开就能放。
 - 播放：按 MyGo 的音质设置映射到脚本声明的音质（`standard → 128k`、`high → 320k`、`lossless → flac`），脚本不支持的音质自动降级。
 - 歌词：脚本支持 `lyric` 动作就用脚本的，否则用插件自带的歌词接口。
@@ -48,7 +48,7 @@ mygo-music://install-plugin?repo=jfeng018/mygo-music-lx-source
 
 | 键 | 说明 |
 | --- | --- |
-| `scriptUrls` | 一个或多个音源脚本直链，逗号 / 分号 / 换行分隔，下载后缓存 10 分钟 |
+| `scriptUrls` | 一个或多个音源脚本直链，换行分隔；逗号 / 分号 / 空格只在后面紧跟另一个链接时才算分隔，不会切断 URL query 里的 `,` 和 `;`。下载最多等 5 秒，之后缓存 10 分钟 |
 | `script` | 直接粘贴脚本内容，作为额外的一个音源 |
 | `platform` | `wy` / `tx` 是 LX 音源里的两个 source key，填一个只搜它，留空两个都搜 |
 
@@ -64,20 +64,25 @@ mygo-music://install-plugin?repo=jfeng018/mygo-music-lx-source
 | `lx.currentScriptInfo` | 从脚本头部的 `@name` / `@version` / `@author` 解析 |
 | `lx.utils.buffer` | 自带的 `Buffer`（utf8 / hex / base64 / latin1） |
 | `lx.utils.crypto.md5` | `host.crypto.md5` |
-| `lx.utils.crypto.randomBytes` | 随机十六进制串 |
+| `lx.utils.crypto.randomBytes` | 随机十六进制串，有 `crypto.getRandomValues` 就走安全随机源 |
 | `lx.utils.crypto.aesEncrypt` | 只支持 AES-ECB（走 `host.crypto.aesEcbEncrypt`） |
 
-脚本用 `new Function` 执行，`module.exports`、`require('crypto')`、`require('buffer')` 都有最小实现。两种写法都认：`module.exports = { sources }`，或者标准的 `on(EVENT_NAMES.request, ...)` + `send(EVENT_NAMES.inited, ...)`。
+脚本用 `new Function` 执行，`module.exports`、`require('crypto')`、`require('buffer')` 都有最小实现。`require('crypto').createHash` 只实现 md5，别的算法会明确报错而不是给一个错误结果。`on(EVENT_NAMES.request, ...)` 可以注册多个，依次尝试。两种写法都认：`module.exports = { sources }`，或者标准的 `on(...)` + `send(EVENT_NAMES.inited, ...)`。
 
-**不支持**：RSA、AES-CBC、zlib。需要这些的音源脚本会明确报错，换一个只用普通 HTTP 接口的即可。
+**不支持**：RSA、AES-CBC、zlib，以及 md5 之外的摘要算法。需要这些的音源脚本会明确报错，换一个只用普通 HTTP 接口的即可。
+
+## 沙箱边界
+
+`new Function` 不是安全沙箱。脚本拿到的是以真实 `globalThis` 为原型的对象，`host` 被显式遮住，但通过原型链或 `Function('return this')()` 仍能回到宿主全局。请把音源脚本当作第三方代码看待，只导入你信任的脚本；插件对脚本的行为不负责。
 
 ## 已知限制
 
 - 搜索只做了 `wy` / `tx` 两个平台，因为它们的公开搜索接口不需要登录。脚本声明了其它平台也不会出现在搜索结果里，但如果你有那些平台的 ID，播放链路本身是通的。
-- 歌词只做了这两个平台。
+- 歌词只做了这两个平台，结果会缓存。
 - 没有登录、歌单、每日推荐——那些需要平台账号，不在这个插件的范围内（社区里已经有专门的单平台插件）。
-- 并发意味着每播一首歌会同时打所有音源，比单源多几倍请求。配太多源既慢又容易被风控，两三个就够。
-- 谁先答就用谁，所以先答的源如果给的是个死链，这次播放就会失败，不会回头等别人。
+- 并发起手会同时打所有音源，赢家出现后其余请求会被取消，但每首歌仍比单源多几倍请求；有多个源时还会各多一次地址探测。配太多源容易被风控，两三个就够。
+- 地址探测只挡明确的 404 / 410、连不上和超时；返回 403 / 405 或需要特定 Referer 的链一律放行，避免误杀。一个看起来正常却实际播不了的链接，这次播放仍会失败。
+- 搜索和歌词不等待音源脚本下载：脚本地址不通只影响播放，不会拖住搜索。首页会显示上次搜索的问题，「音源」页显示上次是哪个脚本播的。
 - 有些脚本会在加载时自己发一次更新检查，网络不通时会报一条没人接的错误。不影响播放，日志里看到可以忽略。
 - 音源脚本是第三方代码，插件只把它的地址交给播放器，不对其内容负责。
 
@@ -87,7 +92,11 @@ mygo-music://install-plugin?repo=jfeng018/mygo-music-lx-source
 node --test test.mjs
 ```
 
-测试用假的 `host` 跑一遍：搜索接口、脚本编译、`musicUrl` 调用链、ID 编解码、多源并发抢答（本地起两个 http 服务，一个快一个慢）、全部失败时的报错。
+测试用假的 `host` 和 stub 过的 `fetch` 跑一遍，不依赖任何第三方接口：搜索、脚本编译、`musicUrl` 调用链、ID 编解码、多源并发抢答（本地起 http 服务提供脚本）、死链回退、地址探测、歌词缓存、全部失败时的报错。想顺带打一次真实搜索接口：
+
+```bash
+LX_ONLINE_TESTS=1 node --test test.mjs
+```
 
 ## License
 

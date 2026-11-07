@@ -1,5 +1,5 @@
-// 用假的 host 跑一遍插件的骨架：搜索、脚本编译、musicUrl 调用链、页面。
-// 音源脚本用本地 fixture，不依赖任何第三方 API；搜索走真实接口。
+// 用假的 host 和 stub 过的 fetch 跑一遍插件，不依赖任何第三方 API。
+// 只有给 fixture 用的本地 http 服务走真实网络；LX_ONLINE_TESTS=1 时额外打一次真实搜索接口。
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -8,6 +8,10 @@ import { createServer } from "node:http";
 
 const store = new Map();
 const settings = new Map();
+const online = process.env.LX_ONLINE_TESTS === "1";
+const fetchCalls = [];
+let lyricFetches = 0;
+let txSearchFails = false;
 
 globalThis.host = {
   platform: "darwin",
@@ -29,6 +33,59 @@ globalThis.host = {
   },
   t: (text) => text,
   language: () => "en",
+};
+
+const realFetch = globalThis.fetch;
+
+const WY_SONG = {
+  id: 2097485069,
+  name: "春日影",
+  ar: [{ id: 1, name: "MyGo" }],
+  al: { id: 11, name: "专辑", picUrl: "http://p1.music.126.net/cover.jpg" },
+  dt: 240000,
+};
+const TX_SONG = {
+  mid: "004Fy3wu3A1gHG",
+  file: { media_mid: "004Fy3wu3A1gHG" },
+  title: "春日影",
+  singer: [{ mid: "s1", name: "MyGo" }],
+  album: { mid: "a1", name: "专辑" },
+  interval: 240,
+};
+
+function jsonResponse(data) {
+  return { ok: true, status: 200, json: async () => data, text: async () => JSON.stringify(data) };
+}
+
+function textResponse(text) {
+  return { ok: true, status: 200, json: async () => JSON.parse(text), text: async () => text };
+}
+
+function probeResponse(status) {
+  return { ok: status < 400, status, json: async () => ({}), text: async () => "" };
+}
+
+globalThis.fetch = async (url, init) => {
+  const target = String(url);
+  fetchCalls.push(target);
+  if (target.startsWith("http://127.0.0.1:")) return realFetch(url, init);
+  if (target.includes("client_search_cp") && txSearchFails) throw new Error("QQ 挂了");
+  if (online && (target.includes("cloudsearch/pc") || target.includes("client_search_cp"))) {
+    return realFetch(url, init);
+  }
+  if (target.includes("cloudsearch/pc")) return jsonResponse({ result: { songs: [WY_SONG] } });
+  if (target.includes("client_search_cp")) return jsonResponse({ data: { song: { list: [TX_SONG] } } });
+  if (target.includes("api/song/lyric")) {
+    lyricFetches++;
+    return jsonResponse({ lrc: { lyric: "[00:00.00]wy 歌词" }, tlyric: { lyric: "[00:00.00]翻译" } });
+  }
+  if (target.includes("fcg_query_lyric_new.fcg")) {
+    lyricFetches++;
+    const lyric = Buffer.from("[00:00.00]tx 歌词").toString("base64");
+    return textResponse(`cb(${JSON.stringify({ lyric })})`);
+  }
+  if (target.includes("dead.example.com")) return probeResponse(404);
+  return probeResponse(206);
 };
 
 const lx = await import("./index.js");
@@ -85,6 +142,7 @@ test("加载音源脚本后能拿到播放地址", async () => {
   assert.equal(stream.url, "https://cdn.example.com/wy/2097485069.mp3");
   assert.equal(stream.type, "mp3");
   assert.equal(stream.quality, "high");
+  assert.equal(store.get("lastSource"), "测试音源 · high");
 });
 
 test("音质按脚本声明的降级", async () => {
@@ -170,6 +228,7 @@ test("多个音源并发，最快给出地址的赢", async (t) => {
 
   const port = server.address().port;
   const urls = `http://127.0.0.1:${port}/slow.js, http://127.0.0.1:${port}/fast.js`;
+  settings.set("script", "");
   settings.set("scriptUrls", urls);
   await lx.setSetting({ key: "scriptUrls", value: urls });
 
@@ -196,6 +255,7 @@ send(EVENT_NAMES.inited, {
 
   const port = server.address().port;
   const urls = `http://127.0.0.1:${port}/a.js, http://127.0.0.1:${port}/b.js`;
+  settings.set("script", "");
   settings.set("scriptUrls", urls);
   await lx.setSetting({ key: "scriptUrls", value: urls });
 
@@ -209,3 +269,185 @@ send(EVENT_NAMES.inited, {
     },
   );
 });
+
+function urlScript(name, target) {
+  return `/**
+ * @name ${name}
+ * @version 1.0.0
+ */
+const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.resolve('${target}'))
+send(EVENT_NAMES.inited, {
+  sources: { wy: { name: 'wy', type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } },
+})
+`;
+}
+
+test("死链探测失败后继续用好链", async (t) => {
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", "text/javascript");
+    response.end(
+      request.url.startsWith("/dead")
+        ? urlScript("死链音源", "https://dead.example.com/x.mp3")
+        : urlScript("好链音源", "https://good.example.com/x.mp3"),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+
+  const port = server.address().port;
+  const urls = `http://127.0.0.1:${port}/dead.js, http://127.0.0.1:${port}/good.js`;
+  settings.set("script", "");
+  settings.set("scriptUrls", urls);
+  await lx.setSetting({ key: "scriptUrls", value: urls });
+
+  const stream = await lx.stream({ id: "wy:123", quality: "standard" });
+  assert.equal(stream.url, "https://good.example.com/x.mp3");
+});
+
+const MULTI_FIXTURE = `/**
+ * @name 多监听器
+ * @version 1.0.0
+ */
+const { EVENT_NAMES, on, send } = globalThis.lx
+on(EVENT_NAMES.request, () => Promise.reject(new Error('unsupported')))
+on(EVENT_NAMES.request, ({ source, info }) =>
+  Promise.resolve('https://cdn.example.com/' + source + '/' + info.musicInfo.songmid + '.mp3'))
+send(EVENT_NAMES.inited, {
+  sources: { wy: { name: 'wy', type: 'music', actions: ['musicUrl'], qualitys: ['128k'] } },
+})
+`;
+
+test("多个 request 监听器会依次尝试", async () => {
+  settings.set("scriptUrls", "");
+  settings.set("script", MULTI_FIXTURE);
+  await lx.setSetting({ key: "script", value: MULTI_FIXTURE });
+  const stream = await lx.stream({ id: "wy:1", quality: "standard" });
+  assert.equal(stream.url, "https://cdn.example.com/wy/1.mp3");
+});
+
+const HASH_FIXTURE = `/**
+ * @name 摘要音源
+ * @version 1.0.0
+ */
+const crypto = require('crypto')
+crypto.createHash('sha256').update('x').digest('hex')
+module.exports = {
+  sources: {
+    wy: {
+      name: 'wy', type: 'music', actions: ['musicUrl'], qualitys: ['128k'],
+      musicUrl() { return 'https://cdn.example.com/x.mp3' },
+    },
+  },
+}
+`;
+
+test("非 md5 摘要会明确报错", async () => {
+  settings.set("scriptUrls", "");
+  settings.set("script", HASH_FIXTURE);
+  await lx.setSetting({ key: "script", value: HASH_FIXTURE });
+  const page = await lx.browse({ page: "sources" });
+  assert.match(JSON.stringify(page), /sha256/);
+});
+
+function sourceScript(name, source) {
+  return `/**
+ * @name ${name}
+ * @version 1.0.0
+ */
+module.exports = {
+  sources: {
+    ${source}: {
+      name: '${source}', type: 'music', actions: ['musicUrl'], qualitys: ['128k'],
+      musicUrl() { return 'https://cdn.example.com/${source}.mp3' },
+    },
+  },
+}
+`;
+}
+
+test("URL 里的逗号分号不会被切断，首页按脚本列平台", async (t) => {
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", "text/javascript");
+    response.end(request.url.startsWith("/a.js") ? sourceScript("只支持 wy", "wy") : sourceScript("只支持 tx", "tx"));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+
+  const port = server.address().port;
+  const urls = `http://127.0.0.1:${port}/a.js?token=1,2;3, http://127.0.0.1:${port}/b.js`;
+  settings.set("script", "");
+  settings.set("scriptUrls", urls);
+  await lx.setSetting({ key: "scriptUrls", value: urls });
+
+  const home = await lx.home();
+  const loaded = home.sections[0];
+  assert.match(loaded.subtitle, /^2 ·/);
+  assert.deepEqual(loaded.links.map((link) => link.subtitle), ["网易云", "QQ"]);
+});
+
+test("单平台搜索失败会记录并在首页显示", async () => {
+  txSearchFails = true;
+  try {
+    const result = await lx.search({ query: "mygo", kind: "tracks", offset: 0 });
+    assert.ok(result.tracks.length > 0);
+    assert.match(store.get("lastSearchError"), /QQ 挂了/);
+    const home = await lx.home();
+    assert.match(JSON.stringify(home), /Last search problem/);
+  } finally {
+    txSearchFails = false;
+  }
+});
+
+test("歌词会缓存，第二次不再请求", async () => {
+  settings.set("scriptUrls", "");
+  settings.set("script", "");
+  await lx.setSetting({ key: "script", value: "" });
+  const before = lyricFetches;
+  const first = await lx.lyrics({ id: "wy:2097485069" });
+  assert.match(first.lrc, /wy 歌词/);
+  const second = await lx.lyrics({ id: "wy:2097485069" });
+  assert.deepEqual(second, first);
+  assert.equal(lyricFetches, before + 1);
+});
+
+test("local 源不参与在线播放", async () => {
+  const local = `/**
+ * @name 本地音源
+ * @version 1.0.0
+ */
+module.exports = {
+  sources: {
+    wy: {
+      name: 'wy', type: 'local', actions: ['musicUrl'], qualitys: ['128k'],
+      musicUrl() { return 'https://cdn.example.com/local.mp3' },
+    },
+  },
+}
+`;
+  settings.set("script", local);
+  await lx.setSetting({ key: "script", value: local });
+  await assert.rejects(
+    () => lx.stream({ id: "wy:123", quality: "standard" }),
+    (error) => error.code === "setup",
+  );
+  const page = await lx.browse({ page: "sources" });
+  assert.doesNotMatch(JSON.stringify(page.sections[0]), /网易云音乐/);
+});
+
+test("搜索不触发音源脚本下载", async () => {
+  settings.set("script", "");
+  settings.set("scriptUrls", "https://slow.example.com/never.js");
+  const before = fetchCalls.length;
+  const result = await lx.search({ query: "mygo", kind: "tracks", offset: 0 });
+  assert.ok(result.tracks.length > 0);
+  assert.ok(!fetchCalls.slice(before).some((url) => url.includes("never.js")));
+  settings.delete("scriptUrls");
+});
+
+if (online) {
+  test("在线：真实搜索接口可用", async () => {
+    const result = await lx.search({ query: "mygo", kind: "tracks", offset: 0 });
+    assert.ok(result.tracks.length > 0);
+  });
+}

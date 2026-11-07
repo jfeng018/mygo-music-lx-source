@@ -15,8 +15,11 @@ const UA =
 
 const SEARCH_LIMIT = 30;
 const SCRIPT_TTL = 10 * 60 * 1000; // 音源脚本缓存多久
+const SCRIPT_FETCH_TIMEOUT = 5000; // 下载一个音源脚本最多等多久
+const URL_CHECK_TIMEOUT = 2500; // 探测播放地址最多等多久
 const STREAM_TIMEOUT = 10000; // 一个音源多久没回应就不再等它
 const TRACK_CACHE_MAX = 600;
+const LYRIC_CACHE_MAX = 200;
 
 const PLATFORM_LABEL = { wy: "网易云音乐", tx: "QQ 音乐" };
 const PLATFORM_SHORT = { wy: "网易云", tx: "QQ" };
@@ -202,15 +205,18 @@ const LXBuffer = {
 
 // ------------------------------------------------------------ lx runtime ----
 
+function newController() {
+  try {
+    return new AbortController();
+  } catch {
+    return null;
+  }
+}
+
 function lxRequest(url, options, callback) {
   const settings = options || {};
   let cancelled = false;
-  let controller = null;
-  try {
-    controller = new AbortController();
-  } catch {
-    controller = null;
-  }
+  const controller = newController();
 
   const init = {
     method: (settings.method || "GET").toUpperCase(),
@@ -253,7 +259,15 @@ function lxRequest(url, options, callback) {
       const result = await Promise.race([
         work,
         new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`请求超时: ${url}`)), timeout);
+          timer = setTimeout(() => {
+            // 超时后把请求本身停掉，不然慢源会一直挂在后台。
+            if (controller) {
+              try {
+                controller.abort();
+              } catch {}
+            }
+            reject(new Error(`请求超时: ${url}`));
+          }, timeout);
         }),
       ]);
       if (!cancelled) callback(null, result);
@@ -285,8 +299,13 @@ function makeUtils() {
       md5: (text) => host.crypto.md5(String(text)),
       randomBytes: (size) => {
         const length = Math.max(1, Number(size) || 16);
+        const bytes = new Uint8Array(length);
+        const provider = globalThis.crypto;
+        if (provider && typeof provider.getRandomValues === "function") provider.getRandomValues(bytes);
+        else for (let i = 0; i < length; i++) bytes[i] = Math.floor(Math.random() * 256);
+        // 和 LX 保持一致：一个字节给一个十六进制字符，长度就是 size。
         let out = "";
-        for (let i = 0; i < length; i++) out += Math.floor(Math.random() * 16).toString(16);
+        for (const byte of bytes) out += (byte & 15).toString(16);
         return out;
       },
       aesEncrypt: (buffer, mode, key, iv) => {
@@ -313,7 +332,9 @@ function requireShim(name) {
   if (name === "buffer") return { Buffer: LXBuffer };
   if (name === "crypto") {
     return {
-      createHash: () => {
+      createHash(algorithm) {
+        const digest = String(algorithm || "md5").toLowerCase();
+        if (digest !== "md5") throw new Error(`这个插件只支持 md5 摘要，脚本要的是 ${digest}`);
         let text = "";
         return {
           update(value) {
@@ -336,6 +357,8 @@ function requireShim(name) {
 function sandboxGlobal(lx) {
   const sandbox = Object.create(globalThis);
   sandbox.lx = lx;
+  // 第三方脚本不该碰到宿主的设置和存储；这只是防误用，不是安全隔离。
+  sandbox.host = undefined;
   // 有些脚本拿 process 判断自己跑在哪，给一个够用的假货。
   sandbox.process = {
     version: "v20.0.0",
@@ -349,6 +372,7 @@ function sandboxGlobal(lx) {
 
 function compileScript(code, info) {
   const listeners = {};
+  const pending = new Set();
   let inited = null;
   let alert = null;
 
@@ -364,7 +388,19 @@ function compileScript(code, info) {
       if (name === "inited") inited = data || {};
       else if (name === "updateAlert") alert = data || null;
     },
-    request: lxRequest,
+    request(url, options, callback) {
+      let stop;
+      const cancel = lxRequest(url, options, (error, result) => {
+        pending.delete(stop);
+        callback(error, result);
+      });
+      stop = () => {
+        pending.delete(stop);
+        cancel();
+      };
+      pending.add(stop);
+      return stop;
+    },
     utils: makeUtils(),
   };
 
@@ -383,11 +419,19 @@ function compileScript(code, info) {
 
   const exported = module.exports || {};
   const sources = exported.sources || (inited && inited.sources) || {};
-  const handler = (listeners.request || [])[0] || null;
-  if (!handler && !Object.keys(sources).length) {
+  const handlers = listeners.request || [];
+  if (!handlers.length && !Object.keys(sources).length) {
     throw new Error("脚本没有导出任何音源（既没有 sources，也没有注册 request 事件）");
   }
-  return { info, sources, handler, alert };
+  return {
+    info,
+    sources,
+    handlers,
+    alert,
+    cancelPending() {
+      for (const cancel of pending) cancel();
+    },
+  };
 }
 
 function scriptInfo(code) {
@@ -409,40 +453,44 @@ function scriptInfo(code) {
 
 // 编译好的音源，按脚本地址列表缓存，避免每次搜索都重新跑一遍脚本。
 let compiled = { key: "", at: 0, runtimes: [], errors: [] };
+let loading = null;
 
-// 多个脚本地址，逗号、分号、空格或换行分隔；只有一个的时候也认。
+// 多个脚本地址按换行分隔；逗号、分号或空格只在后面紧跟另一个链接时才算分隔符，
+// 免得把 URL query 里的 , 或 ; 切断。只有一个地址的时候也认。
 function scriptUrls() {
   const many = (host.setting("scriptUrls") || "").trim();
   const one = many ? "" : (host.setting("scriptUrl") || "").trim();
   const list = (many || one)
-    .split(/[\s,，;；]+/)
-    .map((url) => url.trim())
+    .split(/\r?\n/)
+    .flatMap((line) => line.split(/[,，;；\s]+(?=https?:\/\/)/i))
+    .map((url) => url.trim().replace(/[,，;；\s]+$/, ""))
     .filter(Boolean);
   return [...new Set(list)];
 }
 
 async function fetchScript(url) {
-  const response = await fetch(url, { headers: { "User-Agent": UA } });
-  if (!response.ok) throw new Error(`下载音源脚本失败 (${response.status})`);
-  const code = await response.text();
-  if (!code.trim()) throw new Error("音源脚本是空的");
-  return code;
+  const controller = newController();
+  const init = { headers: { "User-Agent": UA } };
+  if (controller) init.signal = controller.signal;
+  const timer = controller ? setTimeout(() => controller.abort(), SCRIPT_FETCH_TIMEOUT) : null;
+  try {
+    const response = await fetch(url, init);
+    if (!response.ok) throw new Error(`下载音源脚本失败 (${response.status})`);
+    const code = await response.text();
+    if (!code.trim()) throw new Error("音源脚本是空的");
+    return code;
+  } catch (error) {
+    if (controller && controller.signal.aborted) {
+      throw new Error(`下载音源脚本超时 (${SCRIPT_FETCH_TIMEOUT / 1000} 秒)`);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 // 所有脚本一起加载：下载并行，编译各自独立，一个坏了不影响其他的。
-async function loadedScripts(force) {
-  const urls = scriptUrls();
-  const inline = (host.setting("script") || "").trim();
-  const key = `${urls.join("|")}#${inline ? host.crypto.md5(inline) : ""}`;
-
-  if (!urls.length && !inline) {
-    compiled = { key: "", at: 0, runtimes: [], errors: [] };
-    return compiled;
-  }
-  if (!force && compiled.key === key && compiled.at && Date.now() - compiled.at < SCRIPT_TTL) {
-    return compiled;
-  }
-
+async function loadScripts(urls, inline, key) {
   const errors = [];
   const codes = [];
 
@@ -468,10 +516,43 @@ async function loadedScripts(force) {
   return compiled;
 }
 
+async function loadedScripts(force) {
+  const urls = scriptUrls();
+  const inline = (host.setting("script") || "").trim();
+  const key = `${urls.join("|")}#${inline ? host.crypto.md5(inline) : ""}`;
+
+  if (!urls.length && !inline) {
+    loading = null;
+    compiled = { key: "", at: 0, runtimes: [], errors: [] };
+    return compiled;
+  }
+  if (!force && compiled.key === key && compiled.at && Date.now() - compiled.at < SCRIPT_TTL) {
+    return compiled;
+  }
+  // 并发的播放请求共用同一轮加载，别重复下载和编译。
+  if (!force && loading && loading.key === key) return loading.promise;
+
+  const promise = loadScripts(urls, inline, key);
+  loading = { key, promise };
+  try {
+    return await promise;
+  } finally {
+    if (loading && loading.promise === promise) loading = null;
+  }
+}
+
 async function callSource(runtime, source, action, info) {
-  if (runtime.handler) {
-    const answer = await runtime.handler({ source, action, info });
-    return answer;
+  if (runtime.handlers.length) {
+    let lastError = null;
+    for (const handler of runtime.handlers) {
+      try {
+        const answer = await handler({ source, action, info });
+        if (answer != null) return answer;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error(`音源 ${runtime.info.name} 不支持 ${source} 的 ${action}`);
   }
   const entry = runtime.sources[source];
   if (entry && typeof entry[action] === "function") {
@@ -480,12 +561,16 @@ async function callSource(runtime, source, action, info) {
   throw new Error(`音源 ${runtime.info.name} 不支持 ${source} 的 ${action}`);
 }
 
+function declaredSources(runtime) {
+  return Object.keys(runtime.sources || {}).filter(
+    (source) => runtime.sources[source] && runtime.sources[source].type !== "local",
+  );
+}
+
 function availableSources(runtimes) {
   const map = {};
   for (const runtime of runtimes) {
-    for (const source of Object.keys(runtime.sources || {})) {
-      if (runtime.sources[source] && runtime.sources[source].type !== "local") map[source] = true;
-    }
+    for (const source of declaredSources(runtime)) map[source] = true;
   }
   return Object.keys(map);
 }
@@ -612,9 +697,10 @@ function platformsToSearch() {
 
 // ------------------------------------------------------------- exported ----
 
-export async function setSetting({ key, value }) {
+export async function setSetting({ key }) {
   if (key === "scriptUrls" || key === "scriptUrl" || key === "script") {
-    compiled = { key: "", at: 0, runtimes: [], error: null };
+    loading = null;
+    compiled = { key: "", at: 0, runtimes: [], errors: [] };
     try {
       await loadedScripts(true);
       host.storage.remove("lastError");
@@ -645,11 +731,14 @@ export async function search({ query, kind, offset }) {
     }
   });
 
+  if (errors.length) host.storage.set("lastSearchError", errors.join("；"));
+  else host.storage.remove("lastSearchError");
+
   if (!tracks.length && errors.length) throw new Error(errors.join("；"));
   if (!tracks.length) return { tracks: [], more: false };
 
-  // 有音源能播的平台排在前面，省得点开才发现播不了。
-  const playable = new Set(availableSources((await loadedScripts()).runtimes));
+  // 排序只看已经编译好的音源，不在这里下载脚本：脚本地址卡住不该拖慢搜索。
+  const playable = new Set(availableSources(compiled.runtimes));
   const rank = (track) => (playable.has(parseId(track.id).source) ? 0 : 1);
   tracks.sort((a, b) => rank(a) - rank(b));
 
@@ -660,28 +749,46 @@ export async function search({ query, kind, offset }) {
 export async function stream({ id, quality }) {
   const { source, musicInfo } = decodeId(id);
   const { runtimes } = await loadedScripts();
-  const usable = runtimes.filter((runtime) => runtime.sources && runtime.sources[source]);
+  const usable = runtimes.filter((runtime) => {
+    const entry = runtime.sources && runtime.sources[source];
+    return entry && entry.type !== "local";
+  });
   if (!usable.length) {
     const name = PLATFORM_LABEL[source] || source;
     throw fail("setup", `还没有能播 ${name} 的音源，请在插件设置里填入 LX 音源脚本地址`);
   }
 
-  // 每个音源同时要一次地址，谁先给出能播的就用谁，慢的不管了。
+  // 每个音源同时要一次地址，谁先给出能用的就用谁，其余立刻收手。
+  const verify = usable.length > 1;
   const attempts = usable.map((runtime) => {
     const declared = (runtime.sources[source].qualitys || []).filter(Boolean);
     const chain = QUALITY_CHAIN[quality] || QUALITY_CHAIN.high;
     const picked = chain.find((item) => declared.includes(item)) || declared[0] || "128k";
+    const controller = newController();
 
     const promise = withTimeout(
       callSource(runtime, source, "musicUrl", { type: picked, musicInfo }),
       STREAM_TIMEOUT,
-    ).then((answer) => {
-      const url = typeof answer === "string" ? answer : answer && (answer.url || answer.data);
-      if (!url || typeof url !== "string") throw new Error("没有给出地址");
+    ).then(async (answer) => {
+      const raw = typeof answer === "string" ? answer : answer && (answer.url || answer.data);
+      if (!raw || typeof raw !== "string") throw new Error("没有给出地址");
+      const url = secure(raw);
+      if (verify) await verifyUrl(url, controller);
       return { runtime, picked, url };
     });
 
-    return { runtime, promise };
+    return {
+      runtime,
+      promise,
+      cancel() {
+        runtime.cancelPending();
+        if (controller) {
+          try {
+            controller.abort();
+          } catch {}
+        }
+      },
+    };
   });
 
   let winner;
@@ -691,19 +798,62 @@ export async function stream({ id, quality }) {
     throw fail("unavailable", `音源都没给出地址：${error.message}`);
   }
 
+  host.storage.set("lastSource", `${winner.runtime.info.name} · ${qualityOf(winner.picked)}`);
   return { url: winner.url, type: typeOf(winner.url, winner.picked), quality: qualityOf(winner.picked) };
 }
 
-// 谁先成功用谁；全都失败了才报错，错误里带上每个音源的说法。
+// 多个音源时才探测：单源多打一次请求既没意义，又可能因为鉴权误杀好链。
+// 只有明确的 404/410、网络不通或超时算失败，403/405 之类一律放行。
+async function verifyUrl(url, controller) {
+  if (!/^https?:\/\//i.test(url)) throw new Error("给出的不是 http(s) 地址");
+  const init = { method: "GET", headers: { Range: "bytes=0-0", "User-Agent": UA } };
+  if (controller) init.signal = controller.signal;
+  let timer = null;
+  try {
+    await Promise.race([
+      (async () => {
+        const response = await fetch(url, init);
+        if (response.status === 404 || response.status === 410) {
+          throw new Error(`地址返回 ${response.status}`);
+        }
+      })(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("地址探测超时")), URL_CHECK_TIMEOUT);
+      }),
+    ]);
+  } catch (error) {
+    if (controller) {
+      try {
+        controller.abort();
+      } catch {}
+    }
+    throw new Error(`地址不可用：${error.message}`);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// 谁先给出能用的地址就用谁，同时把其余的请求收掉；全失败了才报错。
 function raceSources(attempts) {
   return new Promise((resolve, reject) => {
     let left = attempts.length;
+    let settled = false;
     const errors = [];
     for (const attempt of attempts) {
-      attempt.promise.then(resolve, (error) => {
-        errors.push(`${attempt.runtime.info.name}：${(error && error.message) || error}`);
-        if (--left === 0) reject(new Error(errors.join("；")));
-      });
+      attempt.promise.then(
+        (value) => {
+          if (settled) return;
+          settled = true;
+          for (const other of attempts) {
+            if (other !== attempt) other.cancel();
+          }
+          resolve(value);
+        },
+        (error) => {
+          errors.push(`${attempt.runtime.info.name}：${(error && error.message) || error}`);
+          if (--left === 0 && !settled) reject(new Error(errors.join("；")));
+        },
+      );
     }
   });
 }
@@ -739,43 +889,57 @@ function typeOf(url, quality) {
 }
 
 export async function lyrics({ id }) {
+  const cache = host.storage.get("lyrics") || {};
+  if (cache[id]) return cache[id];
+
   const { source, musicInfo } = decodeId(id);
+  let result = null;
 
   // 音源脚本自己能给歌词就先问它（local 源才有 lyric 动作）。
-  const { runtimes } = await loadedScripts();
-  for (const runtime of runtimes) {
+  for (const runtime of compiled.runtimes) {
     const entry = runtime.sources && runtime.sources[source];
     if (entry && Array.isArray(entry.actions) && entry.actions.includes("lyric")) {
       try {
         const answer = await callSource(runtime, source, "lyric", { musicInfo });
-        if (answer && answer.lyric) return { lrc: answer.lyric, translation: answer.tlyric || "" };
+        if (answer && answer.lyric) result = { lrc: answer.lyric, translation: answer.tlyric || "" };
       } catch {}
     }
+    if (result) break;
   }
 
-  try {
-    if (source === "wy") {
-      const url = `https://music.163.com/api/song/lyric?id=${encodeURIComponent(musicInfo.songmid)}&lv=1&tv=1`;
-      const response = await fetch(url, { headers: { Referer: "https://music.163.com/", "User-Agent": UA } });
-      const data = await response.json();
-      const lrc = data && data.lrc && data.lrc.lyric;
-      if (lrc) return { lrc, translation: (data.tlyric && data.tlyric.lyric) || "" };
-    }
-    if (source === "tx") {
-      const url =
-        `https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=${encodeURIComponent(musicInfo.songmid)}` +
-        `&format=json&nobase64=0&g_tk=5381`;
-      const response = await fetch(url, { headers: { Referer: "https://y.qq.com/", "User-Agent": UA } });
-      let text = await response.text();
-      const wrapped = /^[^(]*\((.*)\)[^)]*$/s.exec(text);
-      if (wrapped) text = wrapped[1];
-      const data = JSON.parse(text);
-      const lrc = data && data.lyric ? bytesToString(base64Decode(data.lyric), "utf8") : "";
-      if (lrc) return { lrc };
-    }
-  } catch {}
+  if (!result) {
+    try {
+      if (source === "wy") {
+        const url = `https://music.163.com/api/song/lyric?id=${encodeURIComponent(musicInfo.songmid)}&lv=1&tv=1`;
+        const response = await fetch(url, { headers: { Referer: "https://music.163.com/", "User-Agent": UA } });
+        const data = await response.json();
+        const lrc = data && data.lrc && data.lrc.lyric;
+        if (lrc) result = { lrc, translation: (data.tlyric && data.tlyric.lyric) || "" };
+      }
+      if (source === "tx") {
+        const url =
+          `https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?songmid=${encodeURIComponent(musicInfo.songmid)}` +
+          `&format=json&nobase64=0&g_tk=5381`;
+        const response = await fetch(url, { headers: { Referer: "https://y.qq.com/", "User-Agent": UA } });
+        let text = await response.text();
+        const wrapped = /^[^(]*\((.*)\)[^)]*$/s.exec(text);
+        if (wrapped) text = wrapped[1];
+        const data = JSON.parse(text);
+        const lrc = data && data.lyric ? bytesToString(base64Decode(data.lyric), "utf8") : "";
+        if (lrc) result = { lrc };
+      }
+    } catch {}
+  }
 
-  throw fail("unsupported", "这首歌没有歌词");
+  if (!result) throw fail("unsupported", "这首歌没有歌词");
+
+  cache[id] = result;
+  const keys = Object.keys(cache);
+  if (keys.length > LYRIC_CACHE_MAX) {
+    for (const key of keys.slice(0, keys.length - LYRIC_CACHE_MAX)) delete cache[key];
+  }
+  host.storage.set("lyrics", cache);
+  return result;
 }
 
 export async function home() {
@@ -789,7 +953,9 @@ export async function home() {
       subtitle: `${runtimes.length} · ${sources.map((source) => PLATFORM_SHORT[source] || source).join(" · ")}`,
       links: runtimes.map((runtime) => ({
         title: runtime.info.name,
-        subtitle: sources.map((source) => PLATFORM_SHORT[source] || source).join(" · ") || t("No sources declared"),
+        subtitle:
+          declaredSources(runtime).map((source) => PLATFORM_SHORT[source] || source).join(" · ") ||
+          t("No sources declared"),
         page: "sources",
       })),
     });
@@ -825,6 +991,9 @@ export async function home() {
     sections.push({ title: t("Couldn't load"), empty: errors.join("\n") });
   }
 
+  const lastSearchError = host.storage.get("lastSearchError");
+  if (lastSearchError) sections.push({ title: t("Last search problem"), empty: lastSearchError });
+
   return { title: t("LX Source"), sections };
 }
 
@@ -835,7 +1004,7 @@ export async function browse({ page }) {
 
   if (runtimes.length) {
     for (const runtime of runtimes) {
-      const sources = Object.keys(runtime.sources || {}).filter((key) => runtime.sources[key].type !== "local");
+      const sources = declaredSources(runtime);
       sections.push({
         title: runtime.info.name,
         subtitle: [runtime.info.author, runtime.info.version].filter(Boolean).join(" · "),
@@ -856,6 +1025,9 @@ export async function browse({ page }) {
   if (errors.length) {
     sections.push({ title: t("Couldn't load"), empty: errors.join("\n") });
   }
+
+  const lastSource = host.storage.get("lastSource");
+  if (lastSource) sections.push({ title: t("Last playback"), empty: lastSource });
 
   sections.push({
     title: t("Note"),

@@ -12,7 +12,7 @@
     {
       "key": "scriptUrls",
       "label": "Source script URLs",
-      "help": "One or more LX Music custom source .js links, separated by commas or new lines. Every source is asked at once when a song plays, and the fastest answer plays."
+      "help": "One or more LX Music custom source .js links, separated by new lines. Commas or semicolons only split when another link follows. Every source is asked at once when a song plays, and the fastest answer plays."
     },
     {
       "key": "script",

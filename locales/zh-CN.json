@@ -2,7 +2,7 @@
   "LX Source": "LX 音源",
   "Sources": "音源",
   "Source script URLs": "音源脚本地址",
-  "One or more LX Music custom source .js links, separated by commas or new lines. Every source is asked at once when a song plays, and the fastest answer plays.": "填一个或多个 LX 音乐自定义音源 .js 链接，用逗号或换行分隔。播放时会同时问所有音源，谁先给出地址就用谁。",
+  "One or more LX Music custom source .js links, separated by new lines. Commas or semicolons only split when another link follows. Every source is asked at once when a song plays, and the fastest answer plays.": "填一个或多个 LX 音乐自定义音源 .js 链接，用换行分隔；逗号或分号后面紧跟另一个链接时才算分隔。播放时会同时问所有音源，谁先给出地址就用谁。",
   "Source script (pasted)": "音源脚本（直接粘贴）",
   "Optional. Paste a script here and it joins the ones above.": "可选。把脚本内容贴在这里，和上面的地址一起用。",
   "Search platform": "搜索平台",
@@ -23,6 +23,8 @@
   "This script declares no sources": "这个脚本没有声明任何音源",
   "Couldn't load": "没加载成功",
   "Quality": "音质",
+  "Last search problem": "上次搜索的问题",
+  "Last playback": "上次播放",
   "Go to the settings and paste an LX source script URL, such as a raw GitHub link.": "去设置里填入一个 LX 音源脚本的地址，比如某个 raw GitHub 链接。",
   "Note": "说明",
   "Source scripts come from third parties: this plugin only hands their play URLs to the player. A script may reach any host, so import only ones you trust.": "音源脚本由第三方提供，插件只负责把它的播放地址交给播放器。脚本请求的域名不受限制，请只导入你信任的脚本。"
