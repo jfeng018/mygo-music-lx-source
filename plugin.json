@@ -21,8 +21,18 @@
     },
     {
       "key": "platform",
-      "label": "Search platform",
-      "help": "wy for NetEase Cloud Music, tx for QQ Music, or leave it empty to search both."
+      "label": "Catalog",
+      "help": "wy, tx, or leave it empty for both. These are source keys, not catalog names; the choice covers search and the discovery pages."
+    },
+    {
+      "key": "catalog",
+      "label": "Catalog browsing",
+      "help": "on or off. Turn it off to hide charts, playlists, daily picks, synced lists and the account menu, leaving search and the source adapter."
+    },
+    {
+      "key": "credential",
+      "label": "Sync credential (optional)",
+      "help": "Only needed when a sign-in window is unavailable. Paste the cookie of your own signed-in web session; it stays on this device and is used just to read your own lists."
     }
   ],
   "navigation": [

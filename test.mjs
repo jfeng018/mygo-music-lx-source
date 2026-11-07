@@ -65,15 +65,39 @@ function probeResponse(status) {
   return { ok: status < 400, status, json: async () => ({}), text: async () => "" };
 }
 
+function musicuFixture(target) {
+  let data = {};
+  try {
+    data = JSON.parse(new URL(target).searchParams.get("data") || "{}");
+  } catch {}
+  if (data.topList) {
+    return jsonResponse({ topList: { data: { group: [{ toplist: [{ topId: 26, title: "热门", headPicUrl: "" }] }] } } });
+  }
+  if (data.detail) {
+    return jsonResponse({ detail: { data: { data: { title: "热门" }, songInfoList: [TX_SONG] } } });
+  }
+  if (data.pl) {
+    return jsonResponse({ pl: { data: { songlist: [{ songinfo: TX_SONG }], total_song_num: 1 } } });
+  }
+  return jsonResponse({});
+}
+
 globalThis.fetch = async (url, init) => {
   const target = String(url);
   fetchCalls.push(target);
   if (target.startsWith("http://127.0.0.1:")) return realFetch(url, init);
-  if (target.includes("client_search_cp") && txSearchFails) throw new Error("QQ 挂了");
-  if (online && (target.includes("cloudsearch/pc") || target.includes("client_search_cp"))) {
-    return realFetch(url, init);
+  if (target.includes("client_search_cp") && txSearchFails) throw new Error("曲库 B 挂了");
+  const songSearch =
+    (target.includes("cloudsearch/pc") && !String((init && init.body) || "").includes("type=1000")) ||
+    target.includes("client_search_cp");
+  if (online && songSearch) return realFetch(url, init);
+
+  if (target.includes("cloudsearch/pc")) {
+    if (String((init && init.body) || "").includes("type=1000")) {
+      return jsonResponse({ result: { playlists: [{ id: 8232, name: "搜索歌单", coverImgUrl: "" }] } });
+    }
+    return jsonResponse({ result: { songs: [WY_SONG] } });
   }
-  if (target.includes("cloudsearch/pc")) return jsonResponse({ result: { songs: [WY_SONG] } });
   if (target.includes("client_search_cp")) return jsonResponse({ data: { song: { list: [TX_SONG] } } });
   if (target.includes("api/song/lyric")) {
     lyricFetches++;
@@ -83,6 +107,33 @@ globalThis.fetch = async (url, init) => {
     lyricFetches++;
     const lyric = Buffer.from("[00:00.00]tx 歌词").toString("base64");
     return textResponse(`cb(${JSON.stringify({ lyric })})`);
+  }
+  if (target.includes("musicu.fcg")) return musicuFixture(target);
+  if (target.includes("/api/toplist/detail")) {
+    return jsonResponse({ list: [{ id: 19723756, name: "飙升", coverImgUrl: "", updateFrequency: "每日" }] });
+  }
+  if (target.includes("/api/v6/playlist/detail")) {
+    return jsonResponse({ playlist: { name: "歌单", tracks: [WY_SONG] } });
+  }
+  if (target.includes("/api/personalized/playlist")) {
+    return jsonResponse({ result: [{ id: 8232, name: "推荐歌单", picUrl: "" }] });
+  }
+  if (target.includes("/api/v3/discovery/recommend/songs")) {
+    return jsonResponse({ data: { dailySongs: [WY_SONG] } });
+  }
+  if (target.includes("/api/nuser/account/get")) {
+    return jsonResponse({ profile: { userId: 42, nickname: "听友", avatarUrl: "" } });
+  }
+  if (target.includes("/api/user/playlist")) {
+    return jsonResponse({ playlist: [{ id: 88, name: "我的歌单", coverImgUrl: "" }] });
+  }
+  if (target.includes("fcg_get_profile_homepage.fcg")) {
+    return jsonResponse({
+      data: { creator: { nick: "听友", headpic: "" }, mymusic: [{ title: "我喜欢", jumpurl: "taoge.html?id=99" }] },
+    });
+  }
+  if (target.includes("client_music_search_songlist")) {
+    return jsonResponse({ data: { list: [{ dissid: 77, dissname: "歌单 B", imgurl: "" }] } });
   }
   if (target.includes("dead.example.com")) return probeResponse(404);
   return probeResponse(206);
@@ -159,7 +210,7 @@ test("首页和音源页认得已加载的脚本", async () => {
   const page = await lx.browse({ page: "sources" });
   const text = JSON.stringify(page);
   assert.match(text, /测试音源/);
-  assert.match(text, /网易云音乐/);
+  assert.match(text, /Catalog A/);
 });
 
 test("ID 编解码把搜索结果还原成 musicInfo", async () => {
@@ -383,7 +434,7 @@ test("URL 里的逗号分号不会被切断，首页按脚本列平台", async (
   const home = await lx.home();
   const loaded = home.sections[0];
   assert.match(loaded.subtitle, /^2 ·/);
-  assert.deepEqual(loaded.links.map((link) => link.subtitle), ["网易云", "QQ"]);
+  assert.deepEqual(loaded.links.map((link) => link.subtitle), ["A", "B"]);
 });
 
 test("单平台搜索失败会记录并在首页显示", async () => {
@@ -391,7 +442,7 @@ test("单平台搜索失败会记录并在首页显示", async () => {
   try {
     const result = await lx.search({ query: "mygo", kind: "tracks", offset: 0 });
     assert.ok(result.tracks.length > 0);
-    assert.match(store.get("lastSearchError"), /QQ 挂了/);
+    assert.match(store.get("lastSearchError"), /曲库 B 挂了/);
     const home = await lx.home();
     assert.match(JSON.stringify(home), /Last search problem/);
   } finally {
@@ -432,7 +483,7 @@ module.exports = {
     (error) => error.code === "setup",
   );
   const page = await lx.browse({ page: "sources" });
-  assert.doesNotMatch(JSON.stringify(page.sections[0]), /网易云音乐/);
+  assert.deepEqual(page.sections[0].links, []);
 });
 
 test("搜索不触发音源脚本下载", async () => {
@@ -443,6 +494,140 @@ test("搜索不触发音源脚本下载", async () => {
   assert.ok(result.tracks.length > 0);
   assert.ok(!fetchCalls.slice(before).some((url) => url.includes("never.js")));
   settings.delete("scriptUrls");
+});
+
+// ---------------- 目录能力 ----------------
+
+async function catalogSetting(key, value) {
+  settings.set(key, value);
+  await lx.setSetting({ key, value });
+}
+
+test("首页发现区只有链接，不出现曲库名称", async () => {
+  await catalogSetting("catalog", "on");
+  const home = await lx.home();
+  const section = home.sections.find((item) => item.title === "Browse");
+  assert.ok(section, "首页应该有发现入口");
+  assert.ok(section.links.every((link) => link.page));
+  assert.ok(!section.tracks, "首页不该拉曲目");
+  assert.doesNotMatch(JSON.stringify(home), /网易|QQ 音乐|NetEase|QQ Music/);
+});
+
+test("榜单页按曲库分组，链接可直接打开", async () => {
+  await catalogSetting("platform", "");
+  const page = await lx.browse({ page: "charts" });
+  assert.equal(page.title, "Charts");
+  assert.equal(page.sections.length, 2);
+  assert.match(page.sections[0].links[0].page, /^chart\|wy\|19723756\|0$/);
+  assert.match(page.sections[1].links[0].page, /^chart\|tx\|26\|0$/);
+});
+
+test("榜单曲目沿用搜索 ID，可直接交给音源播放", async () => {
+  settings.set("script", FIXTURE);
+  await lx.setSetting({ key: "script", value: FIXTURE });
+  const page = await lx.browse({ page: "chart|wy|19723756|0" });
+  const id = page.sections[0].tracks[0].id;
+  assert.equal(id, `wy:${WY_SONG.id}`);
+  const stream = await lx.stream({ id, quality: "standard" });
+  assert.equal(stream.url, `https://cdn.example.com/wy/${WY_SONG.id}.mp3`);
+});
+
+test("另一个曲库的榜单 ID 也带齐播放所需字段", async () => {
+  const page = await lx.browse({ page: "chart|tx|26|0" });
+  assert.equal(page.sections[0].tracks[0].id, `tx:${TX_SONG.mid}:${TX_SONG.file.media_mid}`);
+});
+
+test("歌单搜索返回中性 ID", async () => {
+  const result = await lx.search({ query: "华语", kind: "playlists", offset: 0 });
+  assert.ok(result.playlists.length >= 1);
+  assert.ok(result.playlists.every((item) => /^(wy|tx):/.test(item.id)));
+});
+
+test("歌单详情给出可播曲目", async () => {
+  const wy = await lx.playlist({ id: "wy:8232" });
+  assert.equal(wy.tracks[0].id, `wy:${WY_SONG.id}`);
+  const tx = await lx.playlist({ id: "tx:77" });
+  assert.equal(tx.tracks[0].id, `tx:${TX_SONG.mid}:${TX_SONG.file.media_mid}`);
+});
+
+test("每日曲目在匿名状态下也能打开", async () => {
+  const page = await lx.browse({ page: "daily" });
+  assert.equal(page.sections.length, 2);
+  assert.equal(page.sections[0].tracks[0].id, `wy:${WY_SONG.id}`);
+  assert.equal(page.sections[1].tracks[0].id, `tx:${TX_SONG.mid}:${TX_SONG.file.media_mid}`);
+});
+
+test("曲库切换只影响选中的那一边", async () => {
+  await catalogSetting("platform", "tx");
+  const page = await lx.browse({ page: "charts" });
+  assert.equal(page.sections.length, 1);
+  assert.equal(page.sections[0].title, "Catalog B");
+  const result = await lx.search({ query: "mygo", kind: "tracks", offset: 0 });
+  assert.ok(result.tracks.every((track) => track.id.startsWith("tx:")));
+  await catalogSetting("platform", "");
+});
+
+test("关掉目录后入口与能力都停用，搜索歌曲不受影响", async () => {
+  await catalogSetting("catalog", "off");
+  const home = await lx.home();
+  assert.ok(!home.sections.some((item) => item.title === "Browse"));
+  await assert.rejects(() => lx.browse({ page: "charts" }), (error) => error.code === "unsupported");
+  assert.deepEqual((await lx.search({ query: "华语", kind: "playlists", offset: 0 })).playlists, []);
+  assert.deepEqual(await lx.playlists(), []);
+  await assert.rejects(() => lx.signIn(), (error) => error.code === "unsupported");
+  await assert.rejects(() => lx.playlist({ id: "wy:8232" }), (error) => error.code === "unsupported");
+  store.set("account", { id: "1", name: "x", source: "wy" });
+  assert.equal(lx.account(), null);
+  store.delete("account");
+  assert.ok((await lx.search({ query: "mygo", kind: "tracks", offset: 0 })).tracks.length > 0);
+  await catalogSetting("catalog", "on");
+});
+
+test("登录后同步本人歌单，退出登录即清除", async () => {
+  globalThis.host.webSignIn = async () => ({ cookie: "MUSIC_U=abc; __csrf=1" });
+  try {
+    const signed = await lx.signIn();
+    assert.equal(signed.id, "42");
+    assert.equal(signed.page, "account");
+    assert.deepEqual(lx.account(), signed);
+    const lists = await lx.playlists();
+    assert.ok(lists.some((item) => item.id === "wy:88" && item.mine));
+    const page = await lx.browse({ page: "account" });
+    assert.match(JSON.stringify(page), /我的歌单/);
+    lx.signOut();
+    assert.equal(lx.account(), null);
+    assert.equal(store.has("credential:wy"), false);
+  } finally {
+    delete globalThis.host.webSignIn;
+  }
+});
+
+test("未登录打开我的歌单会提示登录", async () => {
+  await assert.rejects(() => lx.browse({ page: "mine" }), (error) => error.code === "signIn");
+});
+
+test("交付文件里不出现任何曲库名称", async () => {
+  const { readFile } = await import("node:fs/promises");
+  for (const file of ["README.md", "plugin.json", "locales/zh-CN.json", "index.js"]) {
+    const text = await readFile(new URL(`./${file}`, import.meta.url), "utf8");
+    assert.doesNotMatch(text, /网易云|QQ 音乐|NetEase Cloud Music|QQ Music|酷狗|汽水音乐/, file);
+  }
+});
+
+test("所有界面文案都有中文翻译", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const src = await readFile(new URL("./index.js", import.meta.url), "utf8");
+  const plugin = JSON.parse(await readFile(new URL("./plugin.json", import.meta.url), "utf8"));
+  const locales = JSON.parse(await readFile(new URL("./locales/zh-CN.json", import.meta.url), "utf8"));
+  const keys = [...src.matchAll(/\bt\(\s*"([^"]+)"\s*\)/g)].map((match) => match[1]);
+  const texts = [
+    ...plugin.settings.flatMap((item) => [item.label, item.help]),
+    ...plugin.navigation.map((item) => item.title),
+    "Catalog A",
+    "Catalog B",
+  ];
+  const missing = [...new Set([...keys, ...texts])].filter((key) => !(key in locales));
+  assert.deepEqual(missing, []);
 });
 
 if (online) {

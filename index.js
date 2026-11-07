@@ -1,8 +1,8 @@
 // MyGo Music 插件：把洛雪音乐（LX Music）的自定义音源脚本接到 MyGo Music 上。
 //
 // LX 音源脚本只做一件事：把一首歌的 ID 换成播放地址（musicUrl）。搜索、
-// 专辑、歌手这些客户端自己的事它不管，所以这个插件自己做搜索（网易云 /
-// QQ 音乐），拿到 songmid 之后再交给音源脚本换地址。
+// 目录这些客户端自己的事它不管，所以这个插件自己做搜索和榜单/歌单索引，
+// 拿到 ID 之后再交给音源脚本换地址。曲库对外只用中性代号 A / B。
 //
 // 音源脚本从设置里的地址下载，缓存起来，用 new Function 在插件的沙箱里
 // 跑，并补上脚本需要的 globalThis.lx（request / utils / EVENT_NAMES）。
@@ -20,9 +20,17 @@ const URL_CHECK_TIMEOUT = 2500; // 探测播放地址最多等多久
 const STREAM_TIMEOUT = 10000; // 一个音源多久没回应就不再等它
 const TRACK_CACHE_MAX = 600;
 const LYRIC_CACHE_MAX = 200;
+const CATALOG_TTL = 5 * 60 * 1000;
+const CATALOG_TIMEOUT = 8000;
+const CATALOG_PAGE = 30;
+const CHART_LINK_MAX = 24;
+const PLAYLIST_LINK_MAX = 12;
+const PLAYLIST_TRACK_MAX = 100;
+const HOT_CHART_ID = "26";
 
-const PLATFORM_LABEL = { wy: "网易云音乐", tx: "QQ 音乐" };
-const PLATFORM_SHORT = { wy: "网易云", tx: "QQ" };
+// 展示层只用中性代号：wy / tx 是音源脚本里的 source key，不对外展开成名称。
+const CATALOG_LABEL = { wy: "Catalog A", tx: "Catalog B" };
+const CATALOG_SHORT = { wy: "A", tx: "B" };
 
 // MyGo 的音质是 standard / high / lossless，LX 的是 128k / 320k / flac。
 const QUALITY_CHAIN = {
@@ -626,6 +634,431 @@ function remember(tracks) {
   host.storage.set("tracks", cache);
 }
 
+// ------------------------------------------------------------- catalog ----
+
+// 目录只做索引：公开的榜单、歌单、每日曲目，以及登录后本人自己的列表。
+// 这里产出的歌曲 ID 和搜索结果完全一致，拿到就能直接交给 stream() 换地址。
+const CATALOG_SITES = {
+  wy: { referer: "https://music.163.com/", signIn: "https://music.163.com/", until: ["MUSIC_U"] },
+  tx: { referer: "https://y.qq.com/", signIn: "https://y.qq.com/", until: ["uin", "qm_keyst"] },
+};
+const PLAYLIST_QUERIES = ["华语", "流行", "轻音乐", "欧美"];
+
+let catalogCache = new Map();
+const knownPlaylists = new Map();
+
+function catalogOn() {
+  return String(host.setting("catalog") || "on").trim().toLowerCase() !== "off";
+}
+
+function catalogProviders() {
+  const chosen = String(host.setting("platform") || "").trim();
+  return chosen === "wy" || chosen === "tx" ? [chosen] : ["wy", "tx"];
+}
+
+function catalogLabel(source) {
+  return CATALOG_LABEL[source] ? t(CATALOG_LABEL[source]) : source;
+}
+
+function catalogShort(source) {
+  return CATALOG_SHORT[source] || source;
+}
+
+function credential(source) {
+  return String(host.storage.get(`credential:${source}`) || "").trim();
+}
+
+function signedSources() {
+  return Object.keys(CATALOG_SITES).filter((source) => credential(source));
+}
+
+function cookieValue(cookie, name) {
+  const match = String(cookie).match(new RegExp(`(?:^|;\\s*)${name}=([^;]+)`));
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+// 网页端把登录态折算成请求参数的公开算法，只用于读取本人主页。
+function hash33(text) {
+  let value = 5381;
+  for (let i = 0; i < text.length; i++) value += (value << 5) + text.charCodeAt(i);
+  return value & 0x7fffffff;
+}
+
+function catalogHeaders(source, withCredential) {
+  const site = CATALOG_SITES[source] || {};
+  const headers = { "User-Agent": UA, Referer: site.referer || "" };
+  if (withCredential) {
+    const cookie = credential(source);
+    if (cookie) headers.Cookie = cookie;
+  }
+  return headers;
+}
+
+async function apiJson(url, options) {
+  const { source, withCredential, init } = options || {};
+  const controller = newController();
+  const requestInit = {
+    ...(init || {}),
+    headers: { ...catalogHeaders(source, withCredential), ...((init && init.headers) || {}) },
+  };
+  if (controller) requestInit.signal = controller.signal;
+  const timer = controller ? setTimeout(() => controller.abort(), CATALOG_TIMEOUT) : null;
+  try {
+    const response = await fetch(url, requestInit);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const text = await response.text();
+    return JSON.parse(text.replace(/^\s*\w+\(/, "").replace(/\)\s*;?\s*$/, ""));
+  } catch (error) {
+    if (controller && controller.signal.aborted) throw new Error(t("Catalog request timed out"));
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function cached(key, make) {
+  const hit = catalogCache.get(key);
+  if (hit && Date.now() - hit.at < CATALOG_TTL) return hit.promise;
+  const promise = Promise.resolve()
+    .then(make)
+    .catch((error) => {
+      const current = catalogCache.get(key);
+      if (current && current.promise === promise) catalogCache.delete(key);
+      throw error;
+    });
+  catalogCache.set(key, { at: Date.now(), promise });
+  return promise;
+}
+
+function musicu(data, source, withCredential) {
+  const key = withCredential ? cookieValue(credential(source), "qm_keyst") : "";
+  const url =
+    `https://u.y.qq.com/cgi-bin/musicu.fcg?g_tk=${hash33(key)}&format=json` +
+    `&data=${encodeURIComponent(JSON.stringify(data))}`;
+  return apiJson(url, { source, withCredential });
+}
+
+function wyTrack(song) {
+  if (!song || !song.id) return null;
+  const cover = secure(song.al && song.al.picUrl);
+  return {
+    id: `wy:${song.id}`,
+    name: song.name || "",
+    artists: (song.ar || song.artists || []).map((artist) => ({ id: String(artist.id), name: artist.name })),
+    album: {
+      id: String((song.al && song.al.id) || ""),
+      name: (song.al && song.al.name) || "",
+      imageUrl: cover ? `${cover}?param={size}y{size}` : "",
+    },
+    duration: song.dt || song.duration || 0,
+    url: `https://music.163.com/song?id=${song.id}`,
+  };
+}
+
+function txTrack(song) {
+  if (!song || !song.mid) return null;
+  const albumMid = (song.album && song.album.mid) || "";
+  const mediaMid = (song.file && song.file.media_mid) || song.media_mid || song.mid;
+  return {
+    id: `tx:${song.mid}:${mediaMid}`,
+    name: song.title || song.name || "",
+    artists: (song.singer || []).map((artist) => ({ id: String(artist.mid || artist.id), name: artist.name })),
+    album: {
+      id: albumMid || String((song.album && song.album.id) || ""),
+      name: (song.album && song.album.name) || "",
+      imageUrl: albumMid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${albumMid}.jpg` : "",
+    },
+    duration: (song.interval || 0) * 1000,
+    url: `https://y.qq.com/n/ryqq/songDetail/${song.mid}`,
+  };
+}
+
+function prioritize(tracks) {
+  const playable = new Set(availableSources(compiled.runtimes));
+  const rank = (track) => (playable.has(parseId(track.id).source) ? 0 : 1);
+  return tracks.slice().sort((a, b) => rank(a) - rank(b));
+}
+
+function catalogTracks(source, songs) {
+  const tracks = prioritize(songs.map(source === "wy" ? wyTrack : txTrack).filter(Boolean));
+  remember(tracks);
+  return tracks;
+}
+
+function notePlaylist(playlist) {
+  if (knownPlaylists.size > 400) knownPlaylists.clear();
+  knownPlaylists.set(playlist.id, playlist);
+  return playlist;
+}
+
+function wyPlaylist(item) {
+  if (!item || !item.id) return null;
+  return notePlaylist({
+    id: `wy:${item.id}`,
+    name: item.name || "",
+    imageUrl: secure(item.coverImgUrl || item.picUrl || ""),
+    description: item.description || "",
+    owner: (item.creator && item.creator.nickname) || "",
+    trackCount: item.trackCount || 0,
+  });
+}
+
+function txPlaylist(item) {
+  const id = item && (item.dissid || item.diss_tid);
+  if (!id) return null;
+  return notePlaylist({
+    id: `tx:${id}`,
+    name: item.dissname || "",
+    imageUrl: secure(item.imgurl || ""),
+    trackCount: item.song_count || item.songnum || 0,
+    owner: item.nickname || (item.creator && item.creator.nick) || "",
+  });
+}
+
+async function chartsOf(source) {
+  return cached(`charts:${source}`, async () => {
+    if (source === "wy") {
+      const data = await apiJson("https://music.163.com/api/toplist/detail", { source });
+      return (data.list || [])
+        .filter((item) => item && item.id && item.name)
+        .slice(0, CHART_LINK_MAX)
+        .map((item) => ({
+          id: String(item.id),
+          name: item.name,
+          imageUrl: secure(item.coverImgUrl || ""),
+          subtitle: item.updateFrequency || "",
+        }));
+    }
+    const data = await musicu(
+      { comm: { ct: 23, cv: 0 }, topList: { module: "musicToplist.ToplistInfoServer", method: "GetAll", param: {} } },
+      source,
+    );
+    const groups = (data.topList && data.topList.data && data.topList.data.group) || [];
+    const out = [];
+    for (const group of groups) {
+      for (const item of group.toplist || []) {
+        if (item && item.topId && item.title) {
+          out.push({
+            id: String(item.topId),
+            name: item.title,
+            imageUrl: secure(item.headPicUrl || item.frontPicUrl || ""),
+            subtitle: "",
+          });
+        }
+      }
+    }
+    return out.slice(0, CHART_LINK_MAX);
+  });
+}
+
+async function chartTracks(source, id, offset) {
+  return cached(`chart:${source}:${id}:${offset}`, async () => {
+    if (source === "wy") {
+      const data = await apiJson(
+        `https://music.163.com/api/v6/playlist/detail?id=${encodeURIComponent(id)}&n=${PLAYLIST_TRACK_MAX}`,
+        { source },
+      );
+      return catalogTracks("wy", (data.playlist && data.playlist.tracks) || []);
+    }
+    const data = await musicu(
+      {
+        comm: { ct: 24, cv: 0 },
+        detail: {
+          module: "musicToplist.ToplistInfoServer",
+          method: "GetDetail",
+          param: { topId: Number(id), offset: offset || 0, num: CATALOG_PAGE },
+        },
+      },
+      source,
+    );
+    const detail = data.detail && data.detail.data;
+    return catalogTracks("tx", (detail && detail.songInfoList) || []);
+  });
+}
+
+async function featuredPlaylists(source) {
+  return cached(`featured:${source}`, async () => {
+    if (source === "wy") {
+      const data = await apiJson(`https://music.163.com/api/personalized/playlist?limit=${PLAYLIST_LINK_MAX}`, { source });
+      return (data.result || []).map(wyPlaylist).filter(Boolean);
+    }
+    const answers = await Promise.allSettled(
+      PLAYLIST_QUERIES.map((query) =>
+        apiJson(
+          `https://c.y.qq.com/soso/fcgi-bin/client_music_search_songlist?remoteplace=txt.yqq.playlist` +
+            `&page_no=0&num_per_page=8&query=${encodeURIComponent(query)}&format=json`,
+          { source },
+        ),
+      ),
+    );
+    const out = [];
+    for (const answer of answers) {
+      if (answer.status !== "fulfilled") continue;
+      const list = (answer.value.data && answer.value.data.list) || [];
+      for (const item of list) {
+        const playlist = txPlaylist(item);
+        if (playlist) out.push(playlist);
+      }
+    }
+    return out.slice(0, PLAYLIST_LINK_MAX * 2);
+  });
+}
+
+async function playlistTracks(source, id, offset) {
+  return cached(`playlist:${source}:${id}:${offset}`, async () => {
+    if (source === "wy") {
+      const data = await apiJson(
+        `https://music.163.com/api/v6/playlist/detail?id=${encodeURIComponent(id)}&n=${PLAYLIST_TRACK_MAX}`,
+        { source },
+      );
+      return catalogTracks("wy", (data.playlist && data.playlist.tracks) || []);
+    }
+    const data = await musicu(
+      {
+        comm: { ct: 24, cv: 1859 },
+        pl: {
+          module: "music.srfDissInfo.aiDissInfo",
+          method: "uniform_get_Dissinfo",
+          param: { song_begin: offset || 0, song_num: CATALOG_PAGE, disstid: Number(id), ctx: 1 },
+        },
+      },
+      source,
+      true,
+    );
+    const detail = data.pl && data.pl.data;
+    const songs = ((detail && detail.songlist) || []).map((item) => item.songinfo || item);
+    return catalogTracks("tx", songs);
+  });
+}
+
+async function dailyTracks(source) {
+  return cached(`daily:${source}`, async () => {
+    if (source === "wy") {
+      const data = await apiJson("https://music.163.com/api/v3/discovery/recommend/songs", {
+        source,
+        withCredential: true,
+      });
+      return catalogTracks("wy", (data.data && data.data.dailySongs) || []);
+    }
+    return chartTracks("tx", HOT_CHART_ID, 0);
+  });
+}
+
+async function searchPlaylists(query, offset) {
+  if (!catalogOn()) return { playlists: [], more: false };
+  const answers = await Promise.allSettled(
+    catalogProviders().map(async (source) => {
+      if (source === "wy") {
+        const data = await apiJson("https://music.163.com/api/cloudsearch/pc", {
+          source,
+          init: {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: formBody({ s: query, type: 1000, limit: CATALOG_PAGE, offset: offset || 0 }),
+          },
+        });
+        return ((data.result && data.result.playlists) || []).map(wyPlaylist).filter(Boolean);
+      }
+      const page = Math.floor((offset || 0) / CATALOG_PAGE) + 1;
+      const data = await apiJson(
+        `https://c.y.qq.com/soso/fcgi-bin/client_music_search_songlist?remoteplace=txt.yqq.playlist` +
+          `&page_no=${page}&num_per_page=${CATALOG_PAGE}&query=${encodeURIComponent(query)}&format=json`,
+        { source },
+      );
+      return ((data.data && data.data.list) || []).map(txPlaylist).filter(Boolean);
+    }),
+  );
+  const playlists = [];
+  for (const answer of answers) {
+    if (answer.status === "fulfilled") playlists.push(...answer.value);
+  }
+  return { playlists, more: false };
+}
+
+async function txProfile(source) {
+  const cookie = credential(source);
+  const uin = cookieValue(cookie, "uin").replace(/^o/, "").replace(/^0+/, "") || "0";
+  const gtk = hash33(cookieValue(cookie, "qm_keyst"));
+  const url =
+    `https://c6.y.qq.com/rsc/fcgi-bin/fcg_get_profile_homepage.fcg?cv=4747474&ct=24&format=json` +
+    `&inCharset=utf-8&outCharset=utf-8&notice=0&platform=yqq.json&needNewCode=0&uin=${uin}` +
+    `&g_tk_new_20200303=${gtk}&g_tk=${gtk}&cid=205360838&userid=${uin}&reqfrom=1&reqtype=0` +
+    `&hostUin=0&loginUin=${uin}`;
+  return apiJson(url, { source, withCredential: true });
+}
+
+async function profileOf(source) {
+  if (source === "wy") {
+    const data = await apiJson("https://music.163.com/api/nuser/account/get", { source, withCredential: true });
+    const profile = data.profile;
+    if (!profile) throw fail("signIn", t("This credential has expired; sign in again."));
+    return {
+      id: String(profile.userId),
+      name: profile.nickname || t("Listener"),
+      imageUrl: secure(profile.avatarUrl || ""),
+      source,
+    };
+  }
+  const data = await txProfile(source);
+  const creator = (data.data && data.data.creator) || {};
+  const uin = cookieValue(credential(source), "uin") || "0";
+  if (!creator.nick && !creator.headpic) throw fail("signIn", t("This credential has expired; sign in again."));
+  return { id: uin, name: creator.nick || t("Listener"), imageUrl: secure(creator.headpic || ""), source };
+}
+
+async function myPlaylists() {
+  const answers = await Promise.allSettled(
+    signedSources().map(async (source) => {
+      if (source === "wy") {
+        const saved = host.storage.get("account") || {};
+        if (saved.source !== "wy" || !saved.id) return [];
+        const data = await apiJson(
+          `https://music.163.com/api/user/playlist?uid=${encodeURIComponent(saved.id)}&limit=100&offset=0`,
+          { source, withCredential: true },
+        );
+        return (data.playlist || []).map((item) => {
+          const playlist = wyPlaylist(item);
+          if (!playlist) return null;
+          const own = { ...playlist, mine: true };
+          return notePlaylist(own);
+        }).filter(Boolean);
+      }
+      const data = await txProfile(source);
+      const items = (data.data && data.data.mymusic) || [];
+      const out = [];
+      for (const item of items) {
+        const match = /[?&]id=(\d+)/.exec(String(item.jumpurl || ""));
+        if (!match) continue;
+        out.push(notePlaylist({
+          id: `tx:${match[1]}`,
+          name: item.title || "",
+          imageUrl: secure(item.picurl || item.picUrl || ""),
+          trackCount: item.songnum || item.song_count || 0,
+          mine: true,
+        }));
+      }
+      return out;
+    }),
+  );
+  const out = [];
+  for (const answer of answers) {
+    if (answer.status === "fulfilled") out.push(...answer.value);
+  }
+  return out;
+}
+
+function splitCatalogId(id) {
+  const cut = String(id).indexOf(":");
+  if (cut < 0) return null;
+  const source = String(id).slice(0, cut);
+  return CATALOG_SITES[source] ? { source, raw: String(id).slice(cut + 1) } : null;
+}
+
+function pageParts(page, kind) {
+  const text = String(page);
+  return text.startsWith(`${kind}|`) ? text.slice(kind.length + 1).split("|") : null;
+}
+
 // --------------------------------------------------------------- search ----
 
 async function searchWY(query, offset) {
@@ -638,24 +1071,10 @@ async function searchWY(query, offset) {
     },
     body: formBody({ s: query, type: 1, limit: SEARCH_LIMIT, offset }),
   });
-  if (!response.ok) throw new Error(`网易云搜索失败 (${response.status})`);
+  if (!response.ok) throw new Error(`${catalogLabel("wy")} 搜索失败 (${response.status})`);
   const data = await response.json();
   const songs = (data && data.result && data.result.songs) || [];
-  return songs.map((song) => {
-    const cover = secure(song.al && song.al.picUrl);
-    return {
-      id: `wy:${song.id}`,
-      name: song.name,
-      artists: (song.ar || []).map((artist) => ({ id: String(artist.id), name: artist.name })),
-      album: {
-        id: String((song.al && song.al.id) || ""),
-        name: (song.al && song.al.name) || "",
-        imageUrl: cover ? `${cover}?param={size}y{size}` : "",
-      },
-      duration: song.dt || 0,
-      url: `https://music.163.com/song?id=${song.id}`,
-    };
-  });
+  return songs.map(wyTrack).filter(Boolean);
 }
 
 async function searchTX(query, offset) {
@@ -666,38 +1085,22 @@ async function searchTX(query, offset) {
   const response = await fetch(url, {
     headers: { Referer: "https://y.qq.com/", "User-Agent": UA },
   });
-  if (!response.ok) throw new Error(`QQ 音乐搜索失败 (${response.status})`);
+  if (!response.ok) throw new Error(`${catalogLabel("tx")} 搜索失败 (${response.status})`);
   const data = await response.json();
   const songs = (data && data.data && data.data.song && data.data.song.list) || [];
-  return songs.map((song) => {
-    const albumMid = (song.album && song.album.mid) || "";
-    const mediaMid = (song.file && song.file.media_mid) || song.mid;
-    return {
-      id: `tx:${song.mid}:${mediaMid}`,
-      name: song.title || song.name,
-      artists: (song.singer || []).map((artist) => ({ id: String(artist.mid || artist.id), name: artist.name })),
-      album: {
-        id: albumMid || String((song.album && song.album.id) || ""),
-        name: (song.album && song.album.name) || "",
-        imageUrl: albumMid ? `https://y.gtimg.cn/music/photo_new/T002R300x300M000${albumMid}.jpg` : "",
-      },
-      duration: (song.interval || 0) * 1000,
-      url: `https://y.qq.com/n/ryqq/songDetail/${song.mid}`,
-    };
-  });
+  return songs.map(txTrack).filter(Boolean);
 }
 
 const SEARCHERS = { wy: searchWY, tx: searchTX };
 
-function platformsToSearch() {
-  const chosen = (host.setting("platform") || "auto").trim();
-  if (SEARCHERS[chosen]) return [chosen];
-  return ["wy", "tx"];
-}
-
 // ------------------------------------------------------------- exported ----
 
 export async function setSetting({ key }) {
+  if (key === "platform" || key === "catalog" || key === "credential") {
+    catalogCache.clear();
+    knownPlaylists.clear();
+    return;
+  }
   if (key === "scriptUrls" || key === "scriptUrl" || key === "script") {
     loading = null;
     compiled = { key: "", at: 0, runtimes: [], errors: [] };
@@ -712,11 +1115,12 @@ export async function setSetting({ key }) {
 }
 
 export async function search({ query, kind, offset }) {
+  if (kind === "playlists") return searchPlaylists(String(query || "").trim(), offset || 0);
   if (kind !== "tracks") return { [kind]: [], more: false };
   const text = String(query || "").trim();
   if (!text) return { tracks: [], more: false };
 
-  const platforms = platformsToSearch();
+  const platforms = catalogProviders();
   const settled = await Promise.allSettled(platforms.map((platform) => SEARCHERS[platform](text, offset || 0)));
   const tracks = [];
   const errors = [];
@@ -727,7 +1131,7 @@ export async function search({ query, kind, offset }) {
       tracks.push(...result.value);
       if (result.value.length >= SEARCH_LIMIT) more = true;
     } else {
-      errors.push(`${PLATFORM_LABEL[platforms[index]]}: ${result.reason && result.reason.message}`);
+      errors.push(`${catalogLabel(platforms[index])}: ${result.reason && result.reason.message}`);
     }
   });
 
@@ -754,8 +1158,7 @@ export async function stream({ id, quality }) {
     return entry && entry.type !== "local";
   });
   if (!usable.length) {
-    const name = PLATFORM_LABEL[source] || source;
-    throw fail("setup", `还没有能播 ${name} 的音源，请在插件设置里填入 LX 音源脚本地址`);
+    throw fail("setup", `还没有能播 ${catalogLabel(source)} 的音源，请在插件设置里填入 LX 音源脚本地址`);
   }
 
   // 每个音源同时要一次地址，谁先给出能用的就用谁，其余立刻收手。
@@ -950,12 +1353,11 @@ export async function home() {
     const sources = availableSources(runtimes);
     sections.push({
       title: t("Loaded sources"),
-      subtitle: `${runtimes.length} · ${sources.map((source) => PLATFORM_SHORT[source] || source).join(" · ")}`,
+      subtitle: `${runtimes.length} · ${sources.map(catalogShort).join(" · ")}`,
       links: runtimes.map((runtime) => ({
         title: runtime.info.name,
         subtitle:
-          declaredSources(runtime).map((source) => PLATFORM_SHORT[source] || source).join(" · ") ||
-          t("No sources declared"),
+          declaredSources(runtime).map(catalogShort).join(" · ") || t("No sources declared"),
         page: "sources",
       })),
     });
@@ -994,11 +1396,23 @@ export async function home() {
   const lastSearchError = host.storage.get("lastSearchError");
   if (lastSearchError) sections.push({ title: t("Last search problem"), empty: lastSearchError });
 
+  // 发现能力只放几个普通链接，不占侧边栏，也不在首页拉数据。
+  if (catalogOn()) {
+    sections.push({
+      title: t("Browse"),
+      links: [
+        { title: t("Charts"), subtitle: t("What listeners are playing"), page: "charts" },
+        { title: t("Playlists"), subtitle: t("Collections to open"), page: "playlists" },
+        { title: t("Daily picks"), subtitle: t("A fresh set of songs"), page: "daily" },
+        { title: t("My lists"), subtitle: t("Your own collections"), page: "mine" },
+      ],
+    });
+  }
+
   return { title: t("LX Source"), sections };
 }
 
-export async function browse({ page }) {
-  if (page !== "sources") throw fail("unavailable", "没有这个页面");
+async function sourcesPage() {
   const { runtimes, errors } = await loadedScripts();
   const sections = [];
 
@@ -1010,7 +1424,7 @@ export async function browse({ page }) {
         subtitle: [runtime.info.author, runtime.info.version].filter(Boolean).join(" · "),
         empty: t("This script declares no sources"),
         links: sources.map((source) => ({
-          title: PLATFORM_LABEL[source] || source,
+          title: catalogLabel(source),
           subtitle: `${t("Quality")}: ${(runtime.sources[source].qualitys || []).join(" / ") || "—"}`,
         })),
       });
@@ -1037,4 +1451,181 @@ export async function browse({ page }) {
   });
 
   return { title: t("Sources"), sections };
+}
+
+// 目录页只在被点开时才取数据；单个曲库挂掉不影响另一个。
+export async function browse({ page }) {
+  if (page === "sources") return sourcesPage();
+  if (!catalogOn()) throw fail("unsupported", t("Catalog is turned off in the plugin settings."));
+
+  const providers = catalogProviders();
+
+  if (page === "discover") {
+    return {
+      title: t("Browse"),
+      sections: [
+        {
+          title: t("Explore"),
+          links: [
+            { title: t("Charts"), page: "charts" },
+            { title: t("Playlists"), page: "playlists" },
+            { title: t("Daily picks"), page: "daily" },
+            { title: t("My lists"), page: "mine" },
+          ],
+        },
+      ],
+    };
+  }
+
+  if (page === "charts") {
+    const answers = await Promise.allSettled(providers.map((source) => chartsOf(source)));
+    const sections = answers.map((answer, index) => {
+      const source = providers[index];
+      const charts = answer.status === "fulfilled" ? answer.value : [];
+      return {
+        title: catalogLabel(source),
+        empty: t("Charts are unavailable right now"),
+        links: charts.map((chart) => ({
+          title: chart.name,
+          subtitle: chart.subtitle,
+          imageUrl: chart.imageUrl,
+          page: `chart|${source}|${chart.id}|0`,
+        })),
+      };
+    });
+    return { title: t("Charts"), sections };
+  }
+
+  const chartPage = pageParts(page, "chart");
+  if (chartPage) {
+    const [source, id, at] = chartPage;
+    if (!CATALOG_SITES[source]) throw fail("unavailable", t("There is no such page"));
+    const offset = Number(at) || 0;
+    const tracks = await chartTracks(source, id, offset).catch(() => []);
+    const section = { title: t("Charts"), tracks, empty: t("Charts are unavailable right now") };
+    if (tracks.length >= CATALOG_PAGE) section.morePage = `chart|${source}|${id}|${offset + CATALOG_PAGE}`;
+    return { title: t("Charts"), sections: [section] };
+  }
+
+  if (page === "playlists") {
+    const answers = await Promise.allSettled(providers.map((source) => featuredPlaylists(source)));
+    const sections = answers.map((answer, index) => ({
+      title: catalogLabel(providers[index]),
+      playlists: answer.status === "fulfilled" ? answer.value : [],
+      empty: t("Playlists are unavailable right now"),
+    }));
+    return { title: t("Playlists"), sections };
+  }
+
+  const playlistPage = pageParts(page, "playlist");
+  if (playlistPage) {
+    const [source, id, at] = playlistPage;
+    if (!CATALOG_SITES[source]) throw fail("unavailable", t("There is no such page"));
+    return playlistTracksPage(source, id, Number(at) || 0);
+  }
+
+  if (page === "daily") {
+    const answers = await Promise.allSettled(providers.map((source) => dailyTracks(source)));
+    const sections = answers.map((answer, index) => ({
+      title: catalogLabel(providers[index]),
+      tracks: answer.status === "fulfilled" ? answer.value : [],
+      empty: t("Picks are unavailable right now"),
+    }));
+    return { title: t("Daily picks"), sections };
+  }
+
+  if (page === "mine" || page === "account") return myPage(page);
+
+  throw fail("unavailable", t("There is no such page"));
+}
+
+async function playlistTracksPage(source, id, offset) {
+  const meta = knownPlaylists.get(`${source}:${id}`) || {};
+  const tracks = await playlistTracks(source, id, offset).catch(() => []);
+  const section = {
+    title: meta.name || t("Playlist"),
+    tracks,
+    empty: t("This playlist has no tracks available"),
+  };
+  if (tracks.length >= CATALOG_PAGE) section.morePage = `playlist|${source}|${id}|${offset + CATALOG_PAGE}`;
+  return { title: meta.name || t("Playlist"), sections: [section] };
+}
+
+async function myPage(page) {
+  const saved = host.storage.get("account");
+  if (!saved) {
+    if (page === "mine") throw fail("signIn", t("Sign in to sync your own collections."));
+    return { title: t("My lists"), sections: [{ empty: t("Sign in to sync your own collections.") }] };
+  }
+  const lists = await myPlaylists().catch(() => []);
+  return {
+    title: t("My lists"),
+    subtitle: catalogLabel(saved.source),
+    imageUrl: saved.imageUrl || "",
+    sections: [
+      {
+        title: t("Your collections"),
+        playlists: lists,
+        empty: t("No collections came back; sign in again if this persists."),
+      },
+      {
+        title: t("Note"),
+        empty: t("Switch the catalog in the plugin settings, then sign in again to sync another one."),
+      },
+    ],
+  };
+}
+
+// 登录由宿主打开网页让用户自己完成，凭证只留在本机，只用来读本人的列表。
+export async function signIn() {
+  if (!catalogOn()) throw fail("unsupported", t("Catalog is turned off in the plugin settings."));
+  const source = catalogProviders()[0];
+  const site = CATALOG_SITES[source];
+  let cookie = "";
+  if (typeof host.webSignIn === "function") {
+    const answer = await host.webSignIn({
+      url: site.signIn,
+      cookiesOf: site.signIn,
+      until: site.until,
+      userAgent: UA,
+    });
+    cookie = answer && answer.cookie ? String(answer.cookie) : "";
+  }
+  if (!cookie) cookie = String(host.setting("credential") || "").trim();
+  if (!cookie) {
+    throw fail("setup", t("Sign in isn't available here; put your sync credential in the plugin settings."));
+  }
+  host.storage.set(`credential:${source}`, cookie);
+  catalogCache.clear();
+  const profile = await profileOf(source);
+  host.storage.set("account", profile);
+  return account();
+}
+
+export function signOut() {
+  for (const source of Object.keys(CATALOG_SITES)) host.storage.remove(`credential:${source}`);
+  host.storage.remove("account");
+  catalogCache.clear();
+  knownPlaylists.clear();
+}
+
+export function account() {
+  if (!catalogOn()) return null;
+  const saved = host.storage.get("account");
+  if (!saved) return null;
+  return { id: saved.id, name: saved.name, imageUrl: saved.imageUrl || "", page: "account" };
+}
+
+export async function playlists() {
+  if (!catalogOn() || !signedSources().length) return [];
+  return myPlaylists().catch(() => []);
+}
+
+export async function playlist({ id }) {
+  if (!catalogOn()) throw fail("unsupported", t("Catalog is turned off in the plugin settings."));
+  const parts = splitCatalogId(id);
+  if (!parts) throw fail("unavailable", t("There is no such playlist"));
+  const tracks = await playlistTracks(parts.source, parts.raw, 0);
+  const meta = knownPlaylists.get(String(id)) || {};
+  return { id: String(id), name: meta.name || t("Playlist"), tracks, mine: !!meta.mine, trackCount: tracks.length };
 }
