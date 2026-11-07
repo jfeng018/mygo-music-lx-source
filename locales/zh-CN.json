@@ -10,7 +10,7 @@
   "Catalog browsing": "目录浏览",
   "on or off. Turn it off to hide charts, playlists, daily picks, synced lists and the account menu, leaving search and the source adapter.": "填 on 或 off。关掉后榜单、歌单、每日曲目、已同步的列表和账号菜单都不再出现，只剩搜索与音源适配层。",
   "Sync credential (optional)": "同步凭证（可选）",
-  "Only needed when a sign-in window is unavailable. Paste the cookie of your own signed-in web session; it stays on this device and is used just to read your own lists.": "仅在无法弹出登录窗口时才需要。把你自己在网页端登录后产生的 Cookie 粘进来；它只保存在本机，也只用来读取你自己的列表。",
+  "Only needed when QR sign-in is unavailable. Paste the cookie of your own signed-in web session; it stays on this device and is used just to read your own lists.": "仅在扫码登录不可用时才需要。把你自己在网页端登录后产生的 Cookie 粘进来；它只保存在本机，也只用来读取你自己的列表。",
   "Catalog A": "曲库 A",
   "Catalog B": "曲库 B",
   "Loaded sources": "已加载的音源",
@@ -49,6 +49,15 @@
   "Your own collections": "你自己的歌单",
   "Your collections": "你的歌单",
   "Sign in to sync your own collections.": "登录后才能同步你自己的歌单。",
+  "Preparing a sign-in QR code...": "正在生成登录二维码…",
+  "The QR code could not be created; try again.": "二维码生成失败，请重新点击登录。",
+  "Scan the QR code with your phone, then confirm there.": "用手机扫码，并在手机上确认登录。",
+  "Scanned. Confirm the sign-in on your phone.": "已扫码，请在手机上确认登录。",
+  "Signed in.": "登录成功。",
+  "The QR code expired; sign in again.": "二维码已过期，请重新点击登录。",
+  "Sign-in timed out; try again.": "登录超时，请重新点击登录。",
+  "Sign-in was cancelled.": "登录已取消。",
+  "The sign-in did not return a session; try again.": "没有拿到有效的登录态，请重新扫码。",
   "No collections came back; sign in again if this persists.": "没取到你的歌单；一直这样就重新登录一次。",
   "Switch the catalog in the plugin settings, then sign in again to sync another one.": "在插件设置里切换曲库，再登录一次即可同步另一边。",
   "Playlist": "歌单",
@@ -59,5 +68,5 @@
   "Catalog request timed out": "目录请求超时",
   "Listener": "听友",
   "This credential has expired; sign in again.": "凭证已失效，请重新登录。",
-  "Sign in isn't available here; put your sync credential in the plugin settings.": "这里没法打开登录窗口；请在插件设置里填入同步凭证。"
+  "Sign in isn't available here; put your sync credential in the plugin settings.": "这里没法完成扫码登录；请在插件设置里填入同步凭证。"
 }

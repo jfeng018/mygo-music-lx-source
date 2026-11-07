@@ -32,7 +32,7 @@
     {
       "key": "credential",
       "label": "Sync credential (optional)",
-      "help": "Only needed when a sign-in window is unavailable. Paste the cookie of your own signed-in web session; it stays on this device and is used just to read your own lists."
+      "help": "Only needed when QR sign-in is unavailable. Paste the cookie of your own signed-in web session; it stays on this device and is used just to read your own lists."
     }
   ],
   "navigation": [

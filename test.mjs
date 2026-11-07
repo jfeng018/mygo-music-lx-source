@@ -12,6 +12,11 @@ const online = process.env.LX_ONLINE_TESTS === "1";
 const fetchCalls = [];
 let lyricFetches = 0;
 let txSearchFails = false;
+let qrPolls = 0;
+let qrCodes = [803];
+let qrSessionCookie = true;
+const qrPrompts = [];
+const qrRequestHeaders = [];
 
 globalThis.host = {
   platform: "darwin",
@@ -53,16 +58,30 @@ const TX_SONG = {
   interval: 240,
 };
 
-function jsonResponse(data) {
-  return { ok: true, status: 200, json: async () => data, text: async () => JSON.stringify(data) };
+function responseHeaders(setCookies) {
+  const lines = setCookies || [];
+  return {
+    getSetCookie: () => lines,
+    get: (name) => (String(name).toLowerCase() === "set-cookie" ? lines.join(", ") : null),
+  };
+}
+
+function jsonResponse(data, setCookies) {
+  return {
+    ok: true,
+    status: 200,
+    headers: responseHeaders(setCookies),
+    json: async () => data,
+    text: async () => JSON.stringify(data),
+  };
 }
 
 function textResponse(text) {
-  return { ok: true, status: 200, json: async () => JSON.parse(text), text: async () => text };
+  return { ok: true, status: 200, headers: responseHeaders(), json: async () => JSON.parse(text), text: async () => text };
 }
 
 function probeResponse(status) {
-  return { ok: status < 400, status, json: async () => ({}), text: async () => "" };
+  return { ok: status < 400, status, headers: responseHeaders(), json: async () => ({}), text: async () => "" };
 }
 
 function musicuFixture(target) {
@@ -120,6 +139,16 @@ globalThis.fetch = async (url, init) => {
   }
   if (target.includes("/api/v3/discovery/recommend/songs")) {
     return jsonResponse({ data: { dailySongs: [WY_SONG] } });
+  }
+  if (target.includes("/api/login/qrcode/unikey")) {
+    return jsonResponse({ code: 200, unikey: "test-unikey" }, ["NMTID=n1; Path=/"]);
+  }
+  if (target.includes("/api/login/qrcode/client/login")) {
+    const code = qrCodes[Math.min(qrPolls, qrCodes.length - 1)];
+    qrPolls++;
+    qrRequestHeaders.push((init && init.headers) || {});
+    const cookies = code === 803 && qrSessionCookie ? ["MUSIC_U=u1; Path=/", "__csrf=c1; Path=/"] : [];
+    return jsonResponse({ code, message: "" }, cookies);
   }
   if (target.includes("/api/nuser/account/get")) {
     return jsonResponse({ profile: { userId: 42, nickname: "听友", avatarUrl: "" } });
@@ -503,6 +532,18 @@ async function catalogSetting(key, value) {
   await lx.setSetting({ key, value });
 }
 
+// 只缩短扫码轮询的等待，目录请求的超时定时器保持原值。
+async function withFastQrPoll(fn) {
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, ms, ...args) =>
+    realSetTimeout(callback, ms > 1000 && ms < 2000 ? 1 : ms, ...args);
+  try {
+    return await fn();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+}
+
 test("首页发现区只有链接，不出现曲库名称", async () => {
   await catalogSetting("catalog", "on");
   const home = await lx.home();
@@ -599,6 +640,93 @@ test("登录后同步本人歌单，退出登录即清除", async () => {
     assert.equal(store.has("credential:wy"), false);
   } finally {
     delete globalThis.host.webSignIn;
+  }
+});
+
+test("扫码登录：显示二维码、轮询到确认并保存凭证", async () => {
+  globalThis.host.signInPrompt = (prompt) => qrPrompts.push(prompt);
+  qrCodes = [801, 802, 803];
+  qrPolls = 0;
+  qrSessionCookie = true;
+  qrPrompts.length = 0;
+  qrRequestHeaders.length = 0;
+  try {
+    const signed = await withFastQrPoll(() => lx.signIn());
+    assert.equal(signed.id, "42");
+    assert.equal(signed.page, "account");
+    const texts = qrPrompts.map((item) => item.text);
+    assert.ok(texts.includes("Preparing a sign-in QR code..."));
+    assert.ok(texts.includes("Scan the QR code with your phone, then confirm there."));
+    assert.ok(texts.includes("Scanned. Confirm the sign-in on your phone."));
+    assert.ok(texts.includes("Signed in."));
+    const withQr = qrPrompts.find((item) => item.qr);
+    assert.equal(withQr.qr, "https://music.163.com/login?codekey=test-unikey");
+    assert.equal(qrPolls, 3);
+    assert.match(store.get("credential:wy"), /MUSIC_U=u1/);
+    assert.match(store.get("credential:wy"), /__csrf=c1/);
+    assert.match(qrRequestHeaders[0].Cookie, /NMTID=n1/);
+    assert.equal(lx.account().id, "42");
+  } finally {
+    delete globalThis.host.signInPrompt;
+    qrCodes = [803];
+    qrPolls = 0;
+    qrSessionCookie = true;
+    qrPrompts.length = 0;
+    qrRequestHeaders.length = 0;
+    lx.signOut();
+  }
+});
+
+test("扫码登录：过期、缺会话、取消都明确报错", async () => {
+  globalThis.host.signInPrompt = () => {};
+  try {
+    qrCodes = [800];
+    qrPolls = 0;
+    await assert.rejects(
+      () => withFastQrPoll(() => lx.signIn()),
+      (error) => error.code === "setup" && /expired/.test(error.message),
+    );
+
+    qrCodes = [803];
+    qrPolls = 0;
+    qrSessionCookie = false;
+    await assert.rejects(
+      () => withFastQrPoll(() => lx.signIn()),
+      (error) => error.code === "setup" && /did not return a session/.test(error.message),
+    );
+
+    qrCodes = [801];
+    qrPolls = 0;
+    qrSessionCookie = true;
+    const pending = withFastQrPoll(() => lx.signIn());
+    lx.signOut();
+    await assert.rejects(pending, (error) => error.code === "unavailable");
+  } finally {
+    delete globalThis.host.signInPrompt;
+    qrCodes = [803];
+    qrPolls = 0;
+    qrSessionCookie = true;
+    lx.signOut();
+  }
+});
+
+test("没有二维码 UI 时回退到网页窗口，另一个曲库也走网页窗口", async () => {
+  const calls = [];
+  globalThis.host.webSignIn = async (options) => {
+    calls.push(options);
+    return { cookie: "MUSIC_U=abc; __csrf=1" };
+  };
+  try {
+    await lx.signIn();
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, "https://music.163.com/login");
+    await catalogSetting("platform", "tx");
+    await lx.signIn();
+    assert.equal(calls[1].url, "https://y.qq.com/");
+  } finally {
+    delete globalThis.host.webSignIn;
+    await catalogSetting("platform", "");
+    lx.signOut();
   }
 });
 

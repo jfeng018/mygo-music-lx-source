@@ -27,6 +27,11 @@ const CHART_LINK_MAX = 24;
 const PLAYLIST_LINK_MAX = 12;
 const PLAYLIST_TRACK_MAX = 100;
 const HOT_CHART_ID = "26";
+const QR_POLL_INTERVAL = 1500; // 扫码状态多久问一次
+const QR_DEADLINE = 3 * 60 * 1000; // 一张二维码最多等多久
+const QR_UNIKEY_URL = "https://music.163.com/api/login/qrcode/unikey";
+const QR_POLL_URL = "https://music.163.com/api/login/qrcode/client/login";
+const QR_LOGIN_URL = "https://music.163.com/login";
 
 // 展示层只用中性代号：wy / tx 是音源脚本里的 source key，不对外展开成名称。
 const CATALOG_LABEL = { wy: "Catalog A", tx: "Catalog B" };
@@ -639,13 +644,14 @@ function remember(tracks) {
 // 目录只做索引：公开的榜单、歌单、每日曲目，以及登录后本人自己的列表。
 // 这里产出的歌曲 ID 和搜索结果完全一致，拿到就能直接交给 stream() 换地址。
 const CATALOG_SITES = {
-  wy: { referer: "https://music.163.com/", signIn: "https://music.163.com/", until: ["MUSIC_U"] },
+  wy: { referer: "https://music.163.com/", signIn: QR_LOGIN_URL, until: ["MUSIC_U"] },
   tx: { referer: "https://y.qq.com/", signIn: "https://y.qq.com/", until: ["uin", "qm_keyst"] },
 };
 const PLAYLIST_QUERIES = ["华语", "流行", "轻音乐", "欧美"];
 
 let catalogCache = new Map();
 const knownPlaylists = new Map();
+let loginEpoch = 0;
 
 function catalogOn() {
   return String(host.setting("catalog") || "on").trim().toLowerCase() !== "off";
@@ -670,6 +676,107 @@ function credential(source) {
 
 function signedSources() {
   return Object.keys(CATALOG_SITES).filter((source) => credential(source));
+}
+
+function formEncode(data) {
+  return Object.keys(data)
+    .map((key) => `${encodeURIComponent(key)}=${encodeURIComponent(data[key])}`)
+    .join("&");
+}
+
+function cookieHeader(jar) {
+  return Object.keys(jar)
+    .map((name) => `${name}=${jar[name]}`)
+    .join("; ");
+}
+
+// 登录态是响应头里逐个下发的 cookie，攒起来供后续请求和本人列表读取使用。
+function collectCookies(response, jar) {
+  const headers = response && response.headers;
+  let lines = [];
+  if (headers && typeof headers.getSetCookie === "function") {
+    lines = headers.getSetCookie();
+  } else {
+    const raw = headers && typeof headers.get === "function" ? headers.get("set-cookie") || "" : "";
+    lines = String(raw).split(/,(?=\s*[^;,=\s]+=)/);
+  }
+  for (const line of lines) {
+    const pair = String(line).split(";")[0].trim();
+    const eq = pair.indexOf("=");
+    if (eq < 1) continue;
+    const name = pair.slice(0, eq).trim();
+    const value = pair.slice(eq + 1).trim();
+    if (!name) continue;
+    if (!value || value === '""' || /deleted|expired/i.test(String(line))) delete jar[name];
+    else jar[name] = value;
+  }
+}
+
+async function authPost(source, url, data, jar) {
+  const form = { ...data };
+  if (jar.__csrf) form.csrf_token = jar.__csrf;
+  const headers = {
+    "User-Agent": UA,
+    Referer: CATALOG_SITES[source].referer,
+    "Content-Type": "application/x-www-form-urlencoded",
+  };
+  const cookie = cookieHeader(jar);
+  if (cookie) headers.Cookie = cookie;
+
+  const controller = newController();
+  const init = { method: "POST", headers, body: formEncode(form) };
+  if (controller) init.signal = controller.signal;
+  const timer = controller ? setTimeout(() => controller.abort(), CATALOG_TIMEOUT) : null;
+  try {
+    const response = await fetch(url, init);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    collectCookies(response, jar);
+    const text = await response.text();
+    return JSON.parse(text.replace(/^\s*\w+\(/, "").replace(/\)\s*;?\s*$/, ""));
+  } catch (error) {
+    if (controller && controller.signal.aborted) throw new Error(t("Catalog request timed out"));
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function showSignInPrompt(text, qr) {
+  if (typeof host.signInPrompt !== "function") return;
+  host.signInPrompt(qr ? { qr, text } : { text });
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// 二维码由宿主显示；状态轮询到手机确认后才把凭证落到本机。
+async function qrSignIn(source, epoch) {
+  const jar = {};
+  showSignInPrompt(t("Preparing a sign-in QR code..."));
+  const key = await authPost(source, QR_UNIKEY_URL, { type: 3 }, jar);
+  const unikey = key && key.unikey;
+  if (!unikey) throw fail("setup", t("The QR code could not be created; try again."));
+
+  const qr = `${QR_LOGIN_URL}?codekey=${encodeURIComponent(unikey)}`;
+  showSignInPrompt(t("Scan the QR code with your phone, then confirm there."), qr);
+  const deadline = Date.now() + QR_DEADLINE;
+  while (Date.now() < deadline) {
+    if (epoch !== loginEpoch) throw fail("unavailable", t("Sign-in was cancelled."));
+    await wait(QR_POLL_INTERVAL);
+    if (epoch !== loginEpoch) throw fail("unavailable", t("Sign-in was cancelled."));
+
+    const status = await authPost(source, QR_POLL_URL, { key: unikey, type: 3 }, jar);
+    const code = status && status.code;
+    if (code === 800) throw fail("setup", t("The QR code expired; sign in again."));
+    if (code === 802) showSignInPrompt(t("Scanned. Confirm the sign-in on your phone."), qr);
+    if (code === 803) {
+      if (!jar.MUSIC_U) throw fail("setup", t("The sign-in did not return a session; try again."));
+      showSignInPrompt(t("Signed in."));
+      return cookieHeader(jar);
+    }
+  }
+  throw fail("setup", t("Sign-in timed out; try again."));
 }
 
 function cookieValue(cookie, name) {
@@ -1097,6 +1204,7 @@ const SEARCHERS = { wy: searchWY, tx: searchTX };
 
 export async function setSetting({ key }) {
   if (key === "platform" || key === "catalog" || key === "credential") {
+    loginEpoch++;
     catalogCache.clear();
     knownPlaylists.clear();
     return;
@@ -1576,13 +1684,17 @@ async function myPage(page) {
   };
 }
 
-// 登录由宿主打开网页让用户自己完成，凭证只留在本机，只用来读本人的列表。
+// 曲库 A 直接显示登录二维码；曲库 B 由宿主打开网页窗口，在页面里扫码。
+// 凭证只留在本机，只用来读本人的列表。
 export async function signIn() {
   if (!catalogOn()) throw fail("unsupported", t("Catalog is turned off in the plugin settings."));
+  const epoch = ++loginEpoch;
   const source = catalogProviders()[0];
   const site = CATALOG_SITES[source];
   let cookie = "";
-  if (typeof host.webSignIn === "function") {
+  if (source === "wy" && typeof host.signInPrompt === "function") {
+    cookie = await qrSignIn(source, epoch);
+  } else if (typeof host.webSignIn === "function") {
     const answer = await host.webSignIn({
       url: site.signIn,
       cookiesOf: site.signIn,
@@ -1591,6 +1703,7 @@ export async function signIn() {
     });
     cookie = answer && answer.cookie ? String(answer.cookie) : "";
   }
+  if (epoch !== loginEpoch) throw fail("unavailable", t("Sign-in was cancelled."));
   if (!cookie) cookie = String(host.setting("credential") || "").trim();
   if (!cookie) {
     throw fail("setup", t("Sign in isn't available here; put your sync credential in the plugin settings."));
@@ -1603,6 +1716,7 @@ export async function signIn() {
 }
 
 export function signOut() {
+  loginEpoch++;
   for (const source of Object.keys(CATALOG_SITES)) host.storage.remove(`credential:${source}`);
   host.storage.remove("account");
   catalogCache.clear();
